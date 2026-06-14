@@ -1,0 +1,1 @@
+"""Machine-facing RPC API for the OpenTUI frontend."""

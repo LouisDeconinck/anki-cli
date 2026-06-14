@@ -3,6 +3,14 @@ PLAN.md
 .tmp-proto/
 mockups/
 
+# OpenTUI frontend
+frontend/node_modules/
+frontend/dist/
+frontend/coverage/
+frontend/*.tsbuildinfo
+frontend/.cache/
+frontend/.turbo/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
