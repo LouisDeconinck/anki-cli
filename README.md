@@ -217,18 +217,31 @@ Exit codes:
 
 ## AI Agent Integration
 
-This repo ships a `SKILL.md` at the project root that AI agents (Cursor, Windsurf, Cline, etc.) can consume to operate `anki-cli` without human guidance. It covers the full command reference, JSON output structure, search query syntax, error codes, and common workflows.
+This repo ships a [`SKILL.md`](SKILL.md) at the project root — an [agent skill](https://agentskills.io) that AI coding agents can consume to operate `anki-cli` without human guidance. It covers the full command reference, JSON output structure, search query syntax, error codes, and common workflows.
 
-To use it in Cursor, copy or symlink it into your skills directory:
+### Any supported agent (recommended)
 
 ```bash
-# Personal skill (available across all projects)
-mkdir ~/.cursor/skills/anki-cli
-cp SKILL.md ~/.cursor/skills/anki-cli/SKILL.md
+npx skills add ubermenchh/anki-cli
+```
 
-# Or project-local skill (shared via the repo)
-mkdir .cursor/skills/anki-cli
-cp SKILL.md .cursor/skills/anki-cli/SKILL.md
+Automatically detects your installed agents and places the skill in the correct directory. Works with Claude Code, Codex, Cursor, Copilot, OpenCode, and others.
+
+### Manual
+
+Copy or symlink `SKILL.md` into your agent's skills directory:
+
+| Agent | Skill directory |
+|-------|-----------------|
+| Claude Code | `~/.claude/skills/anki-cli/SKILL.md` |
+| Codex | `~/.codex/skills/anki-cli/SKILL.md` |
+| Cursor | `~/.cursor/skills/anki-cli/SKILL.md` |
+| OpenCode | `~/.agents/skills/anki-cli/SKILL.md` |
+| Project-level (any) | `.agents/skills/anki-cli/SKILL.md` |
+
+```bash
+mkdir -p ~/.claude/skills/anki-cli
+cp SKILL.md ~/.claude/skills/anki-cli/SKILL.md
 ```
 
 For other AI coding agents, point them at `SKILL.md` in the repo root or include it in your agent's context/system prompt.
