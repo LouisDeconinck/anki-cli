@@ -250,6 +250,7 @@ allow_non_localhost = false
 [display]
 default_output = "table"
 color = true
+day_boundary_hour = 4
 ```
 
 For remote AnkiConnect (e.g. via Tailscale or LAN):

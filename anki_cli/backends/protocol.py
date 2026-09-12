@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from anki_cli.models.output import JSONValue
+type JSONPrimitive = str | int | float | bool | None
+type JSONValue = JSONPrimitive | Mapping[str, "JSONValue"] | Sequence["JSONValue"]
 
 
 @runtime_checkable
 class AnkiBackend(Protocol):
-    """Backend contract shared by ankiconnect and direct modes."""
+    """Backend contract shared by ankiconnect, direct, and standalone modes."""
 
     name: str
     collection_path: Path | None

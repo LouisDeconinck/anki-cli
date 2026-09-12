@@ -130,7 +130,7 @@ def _card_row(db_path: Path, card_id: int) -> dict[str, Any]:
     ).fetchone()
     conn.close()
     assert row is not None
-    return dict(row)
+    return {k: row[k] for k in row.keys()}
 
 
 def test_move_cards_updates_existing_ids_only(
