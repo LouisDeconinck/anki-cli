@@ -81,7 +81,7 @@ def _note_row(db_path: Path, note_id: int) -> dict[str, Any]:
     ).fetchone()
     conn.close()
     assert row is not None
-    return dict(row)
+    return {k: row[k] for k in row.keys()}
 
 
 def _card_row(db_path: Path, card_id: int) -> dict[str, Any]:
@@ -93,7 +93,7 @@ def _card_row(db_path: Path, card_id: int) -> dict[str, Any]:
     ).fetchone()
     conn.close()
     assert row is not None
-    return dict(row)
+    return {k: row[k] for k in row.keys()}
 
 
 def test_suspend_cards_updates_existing_cards_only(
