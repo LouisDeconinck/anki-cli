@@ -436,13 +436,20 @@ class AnkiDirectReadStore:
             if len(fields) <= 1:
                 raise ValueError("Cannot remove the last remaining field.")
 
+            # Anki declares fields.name COLLATE unicase, so match case-insensitively
+            # (add_notetype_field's `name = ?` lookup already does via SQL).
+            wanted = normalized_field.casefold()
             target_row = next(
-                (item for item in fields if str(item["name"]) == normalized_field),
+                (item for item in fields if str(item["name"]).casefold() == wanted),
                 None,
             )
             if target_row is None:
                 raise LookupError(f"Field not found: {normalized_field}")
             removed_ord = int(target_row["ord"])
+            stored_field_name = str(target_row["name"])
+            old_field_count = len(fields)
+            new_field_count = old_field_count - 1
+            now_sec = int(time.time())
 
             conn.execute(
                 "DELETE FROM fields WHERE ntid = ? AND ord = ?",
@@ -453,15 +460,101 @@ class AnkiDirectReadStore:
                 (ntid, removed_ord),
             )
 
+            # Keep the notetype config consistent with the new field layout.
             config = self._decode_notetype_config(bytes(row["config"] or b""), ntid=ntid)
-            if int(config.sort_field_idx) >= len(fields) - 1:
-                config.sort_field_idx = max(0, len(fields) - 2)
-                conn.execute(
-                    "UPDATE notetypes SET mtime_secs = ?, usn = -1, config = ? WHERE id = ?",
-                    (int(time.time()), bytes(config), ntid),
-                )
+            sort_idx = int(config.sort_field_idx)
+            if sort_idx > removed_ord:
+                sort_idx -= 1
+            # If the sort field itself was removed, Anki (reposition_sort_idx) keeps
+            # the ordinal, so the field that slides into that slot becomes the sort
+            # field; the clamp only matters when the removed field was the last one.
+            sort_idx = max(0, min(sort_idx, new_field_count - 1))
+            config.sort_field_idx = sort_idx
 
-        return {"name": normalized_name, "field": normalized_field, "removed": True}
+            for req in config.reqs:
+                remaining = [
+                    ord_ - 1 if ord_ > removed_ord else ord_
+                    for ord_ in req.field_ords
+                    if ord_ != removed_ord
+                ]
+                if remaining != list(req.field_ords):
+                    req.field_ords = remaining
+                    if not remaining:
+                        req.kind = NotetypeConfigCardRequirementKind.KIND_NONE
+
+            conn.execute(
+                "UPDATE notetypes SET mtime_secs = ?, usn = -1, config = ? WHERE id = ?",
+                (now_sec, bytes(config), ntid),
+            )
+
+            # Field values are stored positionally in notes.flds, so every note of
+            # this notetype must drop the removed slot or all later fields shift.
+            updated_notes = self._remove_field_from_notes(
+                conn,
+                ntid=ntid,
+                removed_ord=removed_ord,
+                field_count=old_field_count,
+                sort_idx=sort_idx,
+                now_sec=now_sec,
+            )
+
+        return {
+            "name": normalized_name,
+            "field": stored_field_name,
+            "removed": True,
+            "updated_notes": updated_notes,
+        }
+
+    def _remove_field_from_notes(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        ntid: int,
+        removed_ord: int,
+        field_count: int,
+        sort_idx: int,
+        now_sec: int,
+    ) -> int:
+        """Drop ``removed_ord`` from every note's positional field list.
+
+        ``field_count`` is the number of fields *before* removal; ``sort_idx`` is
+        the sort field index *after* removal.
+        """
+        note_rows = conn.execute(
+            "SELECT id, flds FROM notes WHERE mid = ?",
+            (ntid,),
+        ).fetchall()
+        if not note_rows:
+            return 0
+
+        updates: list[tuple[str, str, int, int, int]] = []
+        for note_row in note_rows:
+            values = self._split_fields(str(note_row["flds"] or ""))
+            if len(values) < field_count:
+                values.extend([""] * (field_count - len(values)))
+            del values[removed_ord]
+            sfld = (
+                values[sort_idx] if 0 <= sort_idx < len(values) else (values[0] if values else "")
+            )
+            updates.append(
+                (
+                    "\x1f".join(values),
+                    sfld,
+                    self._field_checksum(values[0] if values else ""),
+                    now_sec,
+                    int(note_row["id"]),
+                )
+            )
+
+        conn.executemany(
+            """
+            UPDATE notes
+            SET flds = ?, sfld = ?, csum = ?, mod = ?, usn = -1
+            WHERE id = ?
+            """,
+            updates,
+        )
+        return len(updates)
 
     def add_notetype_template(
         self,
@@ -1355,7 +1448,7 @@ class AnkiDirectReadStore:
         with self._connect_write() as conn:
             deck_rows = conn.execute(
                 """
-                SELECT id, name
+                SELECT id, name, kind
                 FROM decks
                 WHERE name = ? OR name LIKE ?
                 ORDER BY id
@@ -1369,66 +1462,54 @@ class AnkiDirectReadStore:
                     "deleted_decks": 0,
                     "deleted_notes": 0,
                     "deleted_cards": 0,
+                    "returned_cards": 0,
                 }
 
             deck_ids = [int(row["id"]) for row in deck_rows]
-            deck_placeholders = ", ".join(["?"] * len(deck_ids))
+            if 1 in deck_ids:
+                raise ValueError("Cannot delete the Default deck.")
 
-            card_rows = conn.execute(
-                f"SELECT id, nid FROM cards WHERE did IN ({deck_placeholders})",
-                tuple(deck_ids),
-            ).fetchall()
-            card_ids = [int(row["id"]) for row in card_rows]
+            # Filtered decks only borrow cards; deleting one must send the cards
+            # back to their home deck (did = odid, due = odue) rather than delete
+            # them. Normal decks own their cards, including any currently on loan
+            # to a filtered deck (odid = this deck).
+            filtered_ids: list[int] = []
+            normal_ids: list[int] = []
+            for row in deck_rows:
+                did = int(row["id"])
+                kind = self._decode_deck_kind(bytes(row["kind"] or b""), did=did)
+                kind_name, _ = betterproto.which_one_of(kind, "kind")
+                if kind_name == "filtered":
+                    filtered_ids.append(did)
+                elif kind_name == "normal":
+                    normal_ids.append(did)
+                else:
+                    # A destructive dispatch must fail closed on a malformed blob.
+                    raise ValueError(
+                        f"Deck {did} ({row['name']}) has an unknown kind; refusing to delete."
+                    )
 
-            target_note_ids = sorted({int(row["nid"]) for row in card_rows})
-            note_ids_to_delete: list[int] = []
-            if target_note_ids:
-                note_placeholders = ", ".join(["?"] * len(target_note_ids))
-                membership = conn.execute(
-                    f"""
-                    SELECT
-                        c.nid AS nid,
-                        COUNT(*) AS total_cards,
-                        SUM(CASE WHEN c.did IN ({deck_placeholders}) THEN 1 ELSE 0 END)
-                            AS in_scope_cards
-                    FROM cards AS c
-                    WHERE c.nid IN ({note_placeholders})
-                    GROUP BY c.nid
-                    """,
-                    (*deck_ids, *target_note_ids),
-                ).fetchall()
-                for row in membership:
-                    if int(row["total_cards"]) == int(row["in_scope_cards"]):
-                        note_ids_to_delete.append(int(row["nid"]))
+            now_sec = int(time.time())
+            returned_cards = 0
+            if filtered_ids:
+                returned_cards = self._return_cards_from_filtered_decks(
+                    conn, filtered_ids, now_sec=now_sec
+                )
 
             deleted_cards = 0
-            if deck_ids:
-                deleted_cards = int(
-                    conn.execute(
-                        f"DELETE FROM cards WHERE did IN ({deck_placeholders})",
-                        tuple(deck_ids),
-                    ).rowcount
-                )
-
             deleted_notes = 0
-            if note_ids_to_delete:
-                note_placeholders = ", ".join(["?"] * len(note_ids_to_delete))
-                deleted_notes = int(
-                    conn.execute(
-                        f"DELETE FROM notes WHERE id IN ({note_placeholders})",
-                        tuple(note_ids_to_delete),
-                    ).rowcount
+            if normal_ids:
+                deleted_cards, deleted_notes = self._delete_cards_owned_by_decks(
+                    conn, normal_ids
                 )
 
+            deck_placeholders = ", ".join(["?"] * len(deck_ids))
             deleted_decks = int(
                 conn.execute(
                     f"DELETE FROM decks WHERE id IN ({deck_placeholders})",
                     tuple(deck_ids),
                 ).rowcount
             )
-
-            self._insert_graves(conn, card_ids, grave_type=0)
-            self._insert_graves(conn, note_ids_to_delete, grave_type=1)
             self._insert_graves(conn, deck_ids, grave_type=2)
 
         return {
@@ -1437,7 +1518,118 @@ class AnkiDirectReadStore:
             "deleted_decks": deleted_decks,
             "deleted_notes": deleted_notes,
             "deleted_cards": deleted_cards,
+            "returned_cards": returned_cards,
         }
+
+    def _delete_cards_owned_by_decks(
+        self,
+        conn: sqlite3.Connection,
+        deck_ids: list[int],
+    ) -> tuple[int, int]:
+        """Delete every card owned by ``deck_ids`` plus notes left with no cards.
+
+        A card is owned by a deck if it lives there (``did``) or is on loan from
+        there to a filtered deck (``odid``). Ids are staged in temp tables so the
+        graves come from the same set that was deleted, and so we never build an
+        ``IN (?, ?, ...)`` list that could exceed SQLite's variable limit.
+
+        Returns ``(deleted_cards, deleted_notes)``.
+        """
+        placeholders = ", ".join(["?"] * len(deck_ids))
+        # The explicit `odid != 0` is redundant for correctness (deck ids are never
+        # 0) but lets SQLite use Anki's partial index `idx_cards_odid ... WHERE
+        # odid != 0` via MULTI-INDEX OR instead of scanning the cards table.
+        scope = f"(did IN ({placeholders}) OR (odid != 0 AND odid IN ({placeholders})))"
+        scope_params = (*deck_ids, *deck_ids)
+
+        conn.execute("CREATE TEMP TABLE IF NOT EXISTS _del_cids (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TEMP TABLE IF NOT EXISTS _del_nids (id INTEGER PRIMARY KEY)")
+        conn.execute("DELETE FROM _del_cids")
+        conn.execute("DELETE FROM _del_nids")
+
+        conn.execute(
+            f"INSERT INTO _del_cids SELECT id FROM cards WHERE {scope}",
+            scope_params,
+        )
+        # Notes whose every card is being deleted are orphaned and go too.
+        conn.execute(
+            """
+            INSERT INTO _del_nids
+            SELECT nid
+            FROM cards
+            WHERE nid IN (SELECT nid FROM cards WHERE id IN (SELECT id FROM _del_cids))
+            GROUP BY nid
+            HAVING SUM(CASE WHEN id IN (SELECT id FROM _del_cids) THEN 0 ELSE 1 END) = 0
+            """
+        )
+
+        deleted_notes = int(
+            conn.execute("DELETE FROM notes WHERE id IN (SELECT id FROM _del_nids)").rowcount
+        )
+        deleted_cards = int(
+            conn.execute("DELETE FROM cards WHERE id IN (SELECT id FROM _del_cids)").rowcount
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO graves (oid, type, usn) SELECT id, 0, -1 FROM _del_cids"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO graves (oid, type, usn) SELECT id, 1, -1 FROM _del_nids"
+        )
+        conn.execute("DELETE FROM _del_cids")
+        conn.execute("DELETE FROM _del_nids")
+        return deleted_cards, deleted_notes
+
+    def _return_cards_from_filtered_decks(
+        self,
+        conn: sqlite3.Connection,
+        filtered_deck_ids: list[int],
+        *,
+        now_sec: int,
+    ) -> int:
+        """Move cards out of the given filtered decks back to their home decks.
+
+        Mirrors Anki's ``remove_from_filtered_deck_restoring_queue``: restore
+        ``did``/``due`` from ``odid``/``odue`` and recompute ``queue`` from the
+        card type. Suspended and buried cards keep their negative queue.
+        """
+        placeholders = ", ".join(["?"] * len(filtered_deck_ids))
+        # SQLite evaluates SET expressions against the pre-update row, so the
+        # restored due value has to be spelled out again inside the queue CASE.
+        restored_due = "CASE WHEN odue > 0 THEN odue ELSE due END"
+        cursor = conn.execute(
+            f"""
+            UPDATE cards
+            SET did = odid,
+                due = {restored_due},
+                odid = 0,
+                odue = 0,
+                queue = CASE
+                    WHEN queue < 0 THEN queue
+                    WHEN type = 0 THEN 0
+                    WHEN type IN (1, 3) THEN
+                        CASE WHEN ({restored_due}) > 1000000000 THEN 1 ELSE 3 END
+                    ELSE 2
+                END,
+                mod = ?,
+                usn = -1
+            WHERE did IN ({placeholders}) AND odid != 0
+            """,
+            (now_sec, *filtered_deck_ids),
+        )
+        returned = int(cursor.rowcount)
+
+        # A card in a filtered deck with no home deck recorded is malformed;
+        # rather than leave it pointing at a deck that no longer exists, park it
+        # in Default (the same recovery Anki's Check Database performs).
+        stray = conn.execute(
+            f"""
+            UPDATE cards
+            SET did = 1, mod = ?, usn = -1
+            WHERE did IN ({placeholders}) AND odid = 0
+            """,
+            (now_sec, *filtered_deck_ids),
+        )
+        return returned + int(stray.rowcount)
 
     def set_deck_config(
         self,
