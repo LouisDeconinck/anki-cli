@@ -16,10 +16,6 @@ class BackendFactoryError(RuntimeError):
     """Base backend factory error."""
 
 
-class BackendNotImplementedError(BackendFactoryError):
-    """Raised when backend exists in design but is not implemented yet."""
-
-
 def create_backend_from_context(obj: dict[str, Any]) -> AnkiBackend:
     backend_name = str(obj.get("backend", "")).strip().lower()
     collection_path = _coerce_path(obj.get("collection_path"))
@@ -49,11 +45,6 @@ def create_backend_from_context(obj: dict[str, Any]) -> AnkiBackend:
             return DirectBackend(collection_path)
         except (FileNotFoundError, UnsupportedCollectionError) as exc:
             raise BackendFactoryError(str(exc)) from exc
-
-    if backend_name == "standalone":
-        raise BackendNotImplementedError(
-            f"Backend '{backend_name}' is detected but not implemented yet."
-        )
 
     raise BackendFactoryError(f"Unknown backend '{backend_name}'.")
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -11,7 +12,7 @@ from pydantic import ValidationError
 
 from anki_cli.models.config import AppConfig
 
-_ALLOWED_BACKENDS = {"auto", "ankiconnect", "direct", "standalone"}
+_ALLOWED_BACKENDS = {"auto", "ankiconnect", "direct"}
 _ALLOWED_OUTPUTS = {"table", "json", "md", "csv", "plain"}
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -164,6 +165,13 @@ def _resolve_backend(
         candidate = cli_backend
 
     normalized = candidate.strip().lower()
+    if normalized == "standalone":
+        # The standalone backend was removed; keep stale config/env values
+        # working instead of locking out every command (incl. config:set).
+        sys.stderr.write(
+            "warning: backend 'standalone' was removed; using 'auto' instead.\n"
+        )
+        return "auto"
     if normalized not in _ALLOWED_BACKENDS:
         options = ", ".join(sorted(_ALLOWED_BACKENDS))
         raise ConfigError(f"Invalid backend value '{candidate}'. Expected one of: {options}.")

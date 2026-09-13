@@ -10,7 +10,7 @@ import httpx
 
 from anki_cli.models.config import DEFAULT_ANKICONNECT_URL
 
-BackendName = Literal["ankiconnect", "direct", "standalone"]
+BackendName = Literal["ankiconnect", "direct"]
 DEFAULT_ANKICONNECT_TIMEOUT_S: Final[float] = 0.35
 
 class DetectionError(RuntimeError):
@@ -33,9 +33,9 @@ def detect_backend(
 ) -> DetectionResult:
     forced = forced_backend.strip().lower()
 
-    if forced not in {"auto", "ankiconnect", "direct", "standalone"}:
+    if forced not in {"auto", "ankiconnect", "direct"}:
         raise DetectionError(
-            f"Unsupported backend '{forced_backend}'. Expected auto|ankiconnect|direct|standalone.",
+            f"Unsupported backend '{forced_backend}'. Expected auto|ankiconnect|direct.",
             exit_code=2
         )
 
@@ -68,13 +68,6 @@ def detect_backend(
             "direct", path, _reason("forced", anki_profile, col_override)
         )
 
-    if forced == "standalone":
-        return DetectionResult(
-            "standalone",
-            _resolve_standalone_collection(col_override),
-            "forced"
-        )
-
     if _ankiconnect_reachable(ankiconnect_url):
         return DetectionResult(
             "ankiconnect",
@@ -100,10 +93,9 @@ def detect_backend(
             ),
         )
 
-    return DetectionResult(
-        "standalone",
-        _resolve_standalone_collection(col_override),
-        "no ankiconnect and no direct collection found",
+    raise DetectionError(
+        "No AnkiConnect and no collection found.",
+        exit_code=3,
     )
 
 def _ankiconnect_reachable(url: str) -> bool:
@@ -161,19 +153,6 @@ def _resolve_direct_collection(
         )
 
     return candidates[0]
-
-
-def _resolve_standalone_collection(col_override: Path | None) -> Path:
-    if col_override is not None:
-        return col_override.expanduser().resolve()
-
-    cwd = Path.cwd().resolve()
-    for base in (cwd, *cwd.parents):
-        candidate = base / ".anki-cli" / "collection.db"
-        if candidate.exists():
-            return candidate
-
-    return (Path.home() / ".local" / "share" / "anki-cli" / "collection.db").resolve()
 
 
 def _anki_data_roots() -> list[Path]:

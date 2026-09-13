@@ -8,7 +8,7 @@ from anki_cli.models.output import JSONValue
 
 @runtime_checkable
 class AnkiBackend(Protocol):
-    """Backend contract shared by ankiconnect, direct, and standalone modes."""
+    """Backend contract shared by ankiconnect and direct modes."""
 
     name: str
     collection_path: Path | None

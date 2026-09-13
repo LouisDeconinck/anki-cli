@@ -54,7 +54,7 @@ def test_resolve_runtime_config_cli_overrides_env_and_file(
     monkeypatch.setattr(config_runtime, "load_app_config", lambda config_path=None: loaded)
 
     runtime = resolve_runtime_config(
-        cli_backend="standalone",
+        cli_backend="direct",
         cli_backend_set=True,
         cli_output_format="json",
         cli_output_set=True,
@@ -70,7 +70,7 @@ def test_resolve_runtime_config_cli_overrides_env_and_file(
         },
     )
 
-    assert runtime.backend == "standalone"
+    assert runtime.backend == "direct"
     assert runtime.output_format == "json"
     assert runtime.no_color is True
     assert runtime.collection_override == (tmp_path / "from-cli.db").resolve()
@@ -159,6 +159,31 @@ def test_collection_override_from_file_only_when_key_explicit(
         env={},
     )
     assert runtime_with_key.collection_override == (tmp_path / "from-file.db").resolve()
+
+
+def test_resolve_runtime_config_maps_legacy_standalone_to_auto(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A stale prefer='standalone' (file or env) warns and falls back to auto
+    instead of locking out every command — including config:set itself."""
+    loaded = _loaded_config(prefer="standalone")
+    monkeypatch.setattr(config_runtime, "load_app_config", lambda config_path=None: loaded)
+
+    runtime = resolve_runtime_config(
+        cli_backend="auto",
+        cli_backend_set=False,
+        cli_output_format="table",
+        cli_output_set=False,
+        cli_no_color=False,
+        cli_no_color_set=False,
+        cli_collection_path=None,
+        cli_collection_set=False,
+        env={},
+    )
+
+    assert runtime.backend == "auto"
+    assert "standalone" in capsys.readouterr().err
 
 
 def test_resolve_runtime_config_invalid_env_backend(

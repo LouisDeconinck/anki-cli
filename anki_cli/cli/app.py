@@ -24,6 +24,11 @@ def _is_set_on_cli(ctx: click.Context, param_name: str) -> bool:
     return ctx.get_parameter_source(param_name) is ParameterSource.COMMANDLINE
 
 
+# Commands that must work without any Anki backend — they skip detection
+# entirely so they still run (and exit 0) on hosts with no Anki install.
+_BACKENDLESS = {"version", "status", "config", "config:path", "config:set", None}
+
+
 class NamespaceGroup(click.Group):
     """Click group with dynamic command discovery and key=value preprocessing."""
 
@@ -60,12 +65,10 @@ class NamespaceGroup(click.Group):
 @click.option("--col", "collection_path", type=click.Path(path_type=Path), default=None)
 @click.option(
     "--backend",
-    type=click.Choice(["auto", "ankiconnect", "direct", "standalone"], case_sensitive=False),
+    type=click.Choice(["auto", "ankiconnect", "direct"], case_sensitive=False),
     default="auto",
     show_default=True,
 )
-@click.option("--quiet", is_flag=True, default=False)
-@click.option("--verbose", is_flag=True, default=False)
 @click.option("--no-color", is_flag=True, default=False)
 @click.option("--yes", is_flag=True, default=False)
 @click.option("--copy", is_flag=True, default=False)
@@ -84,8 +87,6 @@ def main(
     output_format: str,
     collection_path: Path | None,
     backend: str,
-    quiet: bool,
-    verbose: bool,
     no_color: bool,
     yes: bool,
     copy: bool,
@@ -96,8 +97,6 @@ def main(
             "format": output_format.lower(),
             "collection_path": collection_path,
             "backend": "none",
-            "quiet": quiet,
-            "verbose": verbose,
             "no_color": no_color,
             "yes": yes,
             "copy": copy,
@@ -135,30 +134,39 @@ def main(
         }
     )
 
-    try:
-        detection = detect_backend(
-            forced_backend=runtime.backend,
-            col_override=runtime.collection_override,
-            ankiconnect_url=runtime.app.backend.ankiconnect_url,
-            anki_profile=runtime.app.collection.anki_profile,
+    if ctx.invoked_subcommand in _BACKENDLESS:
+        ctx.obj.update(
+            {
+                "collection_path": runtime.collection_override,
+                "backend": "none",
+                "backend_reason": "not required",
+            }
         )
-    except DetectionError as exc:
-        formatter = formatter_from_ctx(ctx)
-        formatter.emit_error(
-            command="bootstrap",
-            code="BACKEND_UNAVAILABLE",
-            message=str(exc),
-            details={"forced_backend": runtime.backend},
-        )
-        raise click.exceptions.Exit(exc.exit_code) from exc
+    else:
+        try:
+            detection = detect_backend(
+                forced_backend=runtime.backend,
+                col_override=runtime.collection_override,
+                ankiconnect_url=runtime.app.backend.ankiconnect_url,
+                anki_profile=runtime.app.collection.anki_profile,
+            )
+        except DetectionError as exc:
+            formatter = formatter_from_ctx(ctx)
+            formatter.emit_error(
+                command="bootstrap",
+                code="BACKEND_UNAVAILABLE",
+                message=str(exc),
+                details={"forced_backend": runtime.backend},
+            )
+            raise click.exceptions.Exit(exc.exit_code) from exc
 
-    ctx.obj.update(
-        {
-            "collection_path": detection.collection_path,
-            "backend": detection.backend,
-            "backend_reason": detection.reason,
-        }
-    )
+        ctx.obj.update(
+            {
+                "collection_path": detection.collection_path,
+                "backend": detection.backend,
+                "backend_reason": detection.reason,
+            }
+        )
 
     if ctx.invoked_subcommand is None:
         try:

@@ -15,7 +15,6 @@ def _patch_detect_helpers(
     *,
     reachable: bool,
     direct_path: Path | None,
-    standalone_path: Path,
     running: bool = False,
     locked: bool = False,
 ) -> dict[str, Any]:
@@ -29,11 +28,6 @@ def _patch_detect_helpers(
 
     monkeypatch.setattr(detect_mod, "_ankiconnect_reachable", lambda url: reachable)
     monkeypatch.setattr(detect_mod, "_resolve_direct_collection", _resolve_spy)
-    monkeypatch.setattr(
-        detect_mod,
-        "_resolve_standalone_collection",
-        lambda col_override: standalone_path,
-    )
     monkeypatch.setattr(detect_mod, "_anki_process_running", lambda: running)
     monkeypatch.setattr(detect_mod, "_sqlite_write_locked", lambda path: locked)
     return captured
@@ -55,7 +49,6 @@ def test_forced_ankiconnect_unreachable_raises_exit7(
         monkeypatch,
         reachable=False,
         direct_path=tmp_path / "collection.anki2",
-        standalone_path=tmp_path / "standalone.db",
     )
 
     with pytest.raises(DetectionError) as exc_info:
@@ -70,13 +63,11 @@ def test_forced_ankiconnect_returns_result(
     tmp_path: Path,
 ) -> None:
     direct_path = tmp_path / "collection.anki2"
-    standalone_path = tmp_path / "standalone.db"
 
     _patch_detect_helpers(
         monkeypatch,
         reachable=True,
         direct_path=direct_path,
-        standalone_path=standalone_path,
     )
 
     result = detect_backend(forced_backend="  AnKiCoNnEcT  ")
@@ -94,7 +85,6 @@ def test_forced_direct_requires_collection(
         monkeypatch,
         reachable=False,
         direct_path=None,
-        standalone_path=tmp_path / "standalone.db",
     )
 
     with pytest.raises(DetectionError) as exc_info:
@@ -112,7 +102,6 @@ def test_forced_direct_refuses_when_anki_running(
         monkeypatch,
         reachable=False,
         direct_path=tmp_path / "collection.anki2",
-        standalone_path=tmp_path / "standalone.db",
         running=True,
         locked=False,
     )
@@ -132,7 +121,6 @@ def test_forced_direct_refuses_when_db_locked(
         monkeypatch,
         reachable=False,
         direct_path=tmp_path / "collection.anki2",
-        standalone_path=tmp_path / "standalone.db",
         running=False,
         locked=True,
     )
@@ -154,7 +142,6 @@ def test_forced_direct_success(
         monkeypatch,
         reachable=False,
         direct_path=direct_path,
-        standalone_path=tmp_path / "standalone.db",
         running=False,
         locked=False,
     )
@@ -163,26 +150,6 @@ def test_forced_direct_success(
 
     assert result.backend == "direct"
     assert result.collection_path == direct_path
-    assert result.reason == "forced"
-
-
-def test_forced_standalone_success(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    standalone_path = tmp_path / "standalone.db"
-
-    _patch_detect_helpers(
-        monkeypatch,
-        reachable=False,
-        direct_path=None,
-        standalone_path=standalone_path,
-    )
-
-    result = detect_backend(forced_backend="standalone")
-
-    assert result.backend == "standalone"
-    assert result.collection_path == standalone_path
     assert result.reason == "forced"
 
 
@@ -196,7 +163,6 @@ def test_auto_prefers_ankiconnect_when_reachable(
         monkeypatch,
         reachable=True,
         direct_path=direct_path,
-        standalone_path=tmp_path / "standalone.db",
     )
 
     result = detect_backend(forced_backend="auto")
@@ -216,7 +182,6 @@ def test_auto_uses_direct_when_ankiconnect_unreachable(
         monkeypatch,
         reachable=False,
         direct_path=direct_path,
-        standalone_path=tmp_path / "standalone.db",
         running=False,
         locked=False,
     )
@@ -236,7 +201,6 @@ def test_auto_direct_path_but_running_raises_exit7(
         monkeypatch,
         reachable=False,
         direct_path=tmp_path / "collection.anki2",
-        standalone_path=tmp_path / "standalone.db",
         running=True,
         locked=False,
     )
@@ -269,7 +233,6 @@ def test_detect_backend_forwards_anki_profile_to_resolver(
         monkeypatch,
         reachable=reachable,
         direct_path=tmp_path / "collection.anki2",
-        standalone_path=tmp_path / "standalone.db",
     )
 
     result = detect_backend(forced_backend=forced, anki_profile="Work")
@@ -278,26 +241,22 @@ def test_detect_backend_forwards_anki_profile_to_resolver(
     assert "profile 'Work'" in result.reason
 
 
-def test_auto_falls_back_to_standalone(
+def test_auto_raises_when_nothing_found(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
-    standalone_path = tmp_path / "standalone.db"
-
     _patch_detect_helpers(
         monkeypatch,
         reachable=False,
         direct_path=None,
-        standalone_path=standalone_path,
         running=False,
         locked=False,
     )
 
-    result = detect_backend(forced_backend="auto")
+    with pytest.raises(DetectionError) as exc_info:
+        detect_backend(forced_backend="auto")
 
-    assert result.backend == "standalone"
-    assert result.collection_path == standalone_path
-    assert result.reason == "no ankiconnect and no direct collection found"
+    assert exc_info.value.exit_code == 3
+    assert "No AnkiConnect and no collection found" in str(exc_info.value)
 
 
 def test_resolve_direct_collection_override_exists(tmp_path: Path) -> None:

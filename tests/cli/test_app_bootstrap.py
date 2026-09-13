@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import click
+import pytest
 from click.testing import CliRunner
 
 import anki_cli.cli.app as app_mod
@@ -94,7 +95,8 @@ def test_config_error_emits_invalid_config_exit_2(monkeypatch) -> None:
 
 
 def test_detection_error_emits_backend_unavailable_with_exit_code(monkeypatch) -> None:
-    runtime = _runtime(backend="standalone", output_format="json")
+    _install_dummy_command(monkeypatch)
+    runtime = _runtime(backend="direct", output_format="json")
     monkeypatch.setattr(app_mod, "resolve_runtime_config", lambda **kwargs: runtime)
 
     def fail_detect(**kwargs: Any):
@@ -103,13 +105,25 @@ def test_detection_error_emits_backend_unavailable_with_exit_code(monkeypatch) -
     monkeypatch.setattr(app_mod, "detect_backend", fail_detect)
 
     runner = CliRunner()
-    result = runner.invoke(app_mod.main, ["--format", "json"])
+    result = runner.invoke(app_mod.main, ["--format", "json", "dummy"])
 
     payload = _error_payload(result)
     assert result.exit_code == 9
     assert payload["error"]["code"] == "BACKEND_UNAVAILABLE"
-    assert payload["error"]["details"] == {"forced_backend": "standalone"}
+    assert payload["error"]["details"] == {"forced_backend": "direct"}
     assert payload["meta"]["command"] == "bootstrap"
+
+
+def _raise_exit3(**kwargs: Any):
+    raise DetectionError("no AnkiConnect and no collection found", exit_code=3)
+
+
+@pytest.mark.parametrize("argv", [["version"], ["status"], ["config:path"]])
+def test_backend_free_commands_survive_detection_failure(monkeypatch, argv) -> None:
+    monkeypatch.setattr(app_mod, "detect_backend", _raise_exit3)
+    assert (
+        CliRunner().invoke(app_mod.main, ["--format", "json", *argv]).exit_code == 0
+    )
 
 
 def test_bootstrap_success_passes_context_to_subcommand(monkeypatch) -> None:
@@ -244,8 +258,8 @@ def test_cli_parameter_sources_not_marked_when_defaults(monkeypatch) -> None:
         app_mod,
         "detect_backend",
         lambda **kwargs: DetectionResult(
-            backend="standalone",
-            collection_path=Path("/tmp/standalone.db"),
+            backend="direct",
+            collection_path=Path("/tmp/detected.db"),
             reason="fallback",
         ),
     )
@@ -285,23 +299,20 @@ def test_no_subcommand_runs_repl_when_available(monkeypatch) -> None:
             collection_override=Path("/tmp/override.db"),
         ),
     )
-    monkeypatch.setattr(
-        app_mod,
-        "detect_backend",
-        lambda **kwargs: DetectionResult(
-            backend="direct",
-            collection_path=Path("/tmp/detected.db"),
-            reason="ok",
-        ),
-    )
+    def fail_detect(**kwargs: Any):
+        raise AssertionError("detect_backend must not run for bare 'anki'")
+
+    monkeypatch.setattr(app_mod, "detect_backend", fail_detect)
 
     runner = CliRunner()
     result = runner.invoke(app_mod.main, [])
 
     assert result.exit_code == 0, result.output
-    assert calls["obj"]["backend"] == "direct"
-    assert calls["obj"]["collection_path"] == Path("/tmp/detected.db")
-    assert calls["obj"]["backend_reason"] == "ok"
+    # No subcommand is backend-less: the REPL starts with the --col override
+    # (if any) and reports backend "none"; per-command ops resolve lazily.
+    assert calls["obj"]["backend"] == "none"
+    assert calls["obj"]["collection_path"] == Path("/tmp/override.db")
+    assert calls["obj"]["backend_reason"] == "not required"
 
 
 def test_no_subcommand_import_error_falls_back_to_help(monkeypatch) -> None:
@@ -315,15 +326,11 @@ def test_no_subcommand_import_error_falls_back_to_help(monkeypatch) -> None:
             collection_override=None,
         ),
     )
-    monkeypatch.setattr(
-        app_mod,
-        "detect_backend",
-        lambda **kwargs: DetectionResult(
-            backend="direct",
-            collection_path=Path("/tmp/detected.db"),
-            reason="ok",
-        ),
-    )
+
+    def fail_detect(**kwargs: Any):
+        raise AssertionError("detect_backend must not run for bare 'anki'")
+
+    monkeypatch.setattr(app_mod, "detect_backend", fail_detect)
 
     monkeypatch.setattr(app_mod, "list_commands", lambda: [])
     monkeypatch.setattr(app_mod, "get_command", lambda name: None)

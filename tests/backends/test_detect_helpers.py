@@ -206,45 +206,6 @@ def test_resolve_direct_collection_col_override_wins_over_profile(
     assert resolved == override.resolve()
 
 
-def test_resolve_standalone_collection_override(tmp_path: Path) -> None:
-    override = tmp_path / "x" / "collection.db"
-    expected = override.resolve()
-
-    assert detect_mod._resolve_standalone_collection(override) == expected
-
-
-def test_resolve_standalone_collection_prefers_nearest_parent(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    project = tmp_path / "project"
-    nested = project / "a" / "b"
-    nested.mkdir(parents=True)
-
-    db = project / ".anki-cli" / "collection.db"
-    db.parent.mkdir(parents=True)
-    db.touch()
-
-    monkeypatch.chdir(nested)
-
-    assert detect_mod._resolve_standalone_collection(None) == db.resolve()
-
-
-def test_resolve_standalone_collection_falls_back_to_home(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    home = tmp_path / "home"
-    work = tmp_path / "work"
-    work.mkdir()
-
-    _patch_path_home(monkeypatch, home)
-    monkeypatch.chdir(work)
-
-    expected = (home / ".local" / "share" / "anki-cli" / "collection.db").resolve()
-    assert detect_mod._resolve_standalone_collection(None) == expected
-
-
 def test_anki_data_roots_darwin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     home = tmp_path / "home"
     _patch_path_home(monkeypatch, home)
