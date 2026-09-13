@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import anki_cli.backends.detect as detect_mod
 import anki_cli.config_runtime as config_runtime
 from anki_cli.config_runtime import (
     ConfigError,
@@ -20,7 +21,7 @@ def _loaded_config(
     prefer: str = "auto",
     output: str = "table",
     color: bool = True,
-    collection_path: str = "~/.local/share/anki-cli/collection.db",
+    collection_path: str | None = None,
     file_data: dict[str, object] | None = None,
     config_path: Path | None = None,
 ) -> LoadedConfig:
@@ -212,8 +213,67 @@ def test_set_config_value_round_trip_bool(tmp_path: Path) -> None:
     assert old_value is True
     assert new_value is False
 
+    # The written file must carry every section header — reload refilling
+    # defaults would hide a missing section otherwise.
+    text = config_path.read_text(encoding="utf-8")
+    for header in ("[collection]", "[backend]", "[display]"):
+        assert header in text
+
     reloaded = load_app_config(config_path=config_path)
     assert reloaded.app.display.color is False
+
+
+def test_set_anki_profile_does_not_persist_collection_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: config:set must not persist the unset collection.path.
+
+    A written ``collection.path`` acts as an explicit --col override on the
+    next run; persisting the old dead default made every command exit 3.
+    """
+    config_path = tmp_path / "config.toml"
+
+    _loaded, old_value, new_value = set_config_value(
+        key="collection.anki_profile",
+        raw_value="Work",
+        config_path=config_path,
+    )
+
+    assert old_value is None
+    assert new_value == "Work"
+
+    text = config_path.read_text(encoding="utf-8")
+    assert 'anki_profile = "Work"' in text
+    assert "collection.db" not in text
+
+    reloaded = load_app_config(config_path=config_path)
+    assert reloaded.app.collection.anki_profile == "Work"
+    assert reloaded.app.collection.path is None
+
+    override = config_runtime._resolve_collection_override(
+        cli_collection_path=None,
+        cli_collection_set=False,
+        env_collection=None,
+        file_collection=reloaded.app.collection.path,
+        file_data=reloaded.file_data,
+    )
+    assert override is None
+
+    # ...and the configured profile still resolves a real collection.
+    root = tmp_path / "Anki2"
+    profile_dir = root / "Work"
+    profile_dir.mkdir(parents=True)
+    db = profile_dir / "collection.anki2"
+    db.touch()
+    monkeypatch.setattr(detect_mod, "_anki_data_roots", lambda: [root])
+
+    assert (
+        detect_mod._resolve_direct_collection(
+            None, anki_profile=reloaded.app.collection.anki_profile
+        )
+        == db
+    )
 
 
 def test_set_config_value_unknown_key_raises(tmp_path: Path) -> None:
@@ -225,11 +285,21 @@ def test_set_config_value_unknown_key_raises(tmp_path: Path) -> None:
         )
 
 
-def test_set_config_value_invalid_int_raises(tmp_path: Path) -> None:
-    with pytest.raises(ConfigError, match="Expected integer"):
+def test_set_config_value_rejects_section_key(tmp_path: Path) -> None:
+    # A key naming a whole section resolves to a non-scalar value.
+    with pytest.raises(ConfigError, match="Unsupported value type"):
+        set_config_value(
+            key="display",
+            raw_value="[1]",
+            config_path=tmp_path / "config.toml",
+        )
+
+
+def test_set_config_value_rejects_unknown_section(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="Unknown config key"):
         set_config_value(
             key="review.max_answer_seconds",
-            raw_value="not-an-int",
+            raw_value="60",
             config_path=tmp_path / "config.toml",
         )
 

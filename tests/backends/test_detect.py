@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -17,9 +18,17 @@ def _patch_detect_helpers(
     standalone_path: Path,
     running: bool = False,
     locked: bool = False,
-) -> None:
+) -> dict[str, Any]:
+    """Patch detect internals; returns a dict capturing resolver kwargs."""
+    captured: dict[str, Any] = {}
+
+    def _resolve_spy(col_override, anki_profile=None):
+        captured["col_override"] = col_override
+        captured["anki_profile"] = anki_profile
+        return direct_path
+
     monkeypatch.setattr(detect_mod, "_ankiconnect_reachable", lambda url: reachable)
-    monkeypatch.setattr(detect_mod, "_resolve_direct_collection", lambda col_override: direct_path)
+    monkeypatch.setattr(detect_mod, "_resolve_direct_collection", _resolve_spy)
     monkeypatch.setattr(
         detect_mod,
         "_resolve_standalone_collection",
@@ -27,6 +36,7 @@ def _patch_detect_helpers(
     )
     monkeypatch.setattr(detect_mod, "_anki_process_running", lambda: running)
     monkeypatch.setattr(detect_mod, "_sqlite_write_locked", lambda path: locked)
+    return captured
 
 
 def test_detect_backend_rejects_unknown_forced_backend() -> None:
@@ -236,6 +246,36 @@ def test_auto_direct_path_but_running_raises_exit7(
 
     assert exc_info.value.exit_code == 7
     assert "Anki is running but AnkiConnect is unavailable" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("forced", "reachable"),
+    [
+        ("auto", True),
+        ("auto", False),
+        ("direct", False),
+        ("ankiconnect", True),
+    ],
+)
+def test_detect_backend_forwards_anki_profile_to_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    forced: str,
+    reachable: bool,
+) -> None:
+    # Pins every _resolve_direct_collection call site in detect_backend:
+    # dropping `anki_profile=` anywhere along these paths must fail.
+    captured = _patch_detect_helpers(
+        monkeypatch,
+        reachable=reachable,
+        direct_path=tmp_path / "collection.anki2",
+        standalone_path=tmp_path / "standalone.db",
+    )
+
+    result = detect_backend(forced_backend=forced, anki_profile="Work")
+
+    assert captured["anki_profile"] == "Work"
+    assert "profile 'Work'" in result.reason
 
 
 def test_auto_falls_back_to_standalone(

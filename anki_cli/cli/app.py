@@ -140,6 +140,7 @@ def main(
             forced_backend=runtime.backend,
             col_override=runtime.collection_override,
             ankiconnect_url=runtime.app.backend.ankiconnect_url,
+            anki_profile=runtime.app.collection.anki_profile,
         )
     except DetectionError as exc:
         formatter = formatter_from_ctx(ctx)

@@ -29,6 +29,7 @@ def detect_backend(
     forced_backend: str = "auto",
     col_override: Path | None = None,
     ankiconnect_url: str = DEFAULT_ANKICONNECT_URL,
+    anki_profile: str | None = None,
 ) -> DetectionResult:
     forced = forced_backend.strip().lower()
 
@@ -46,12 +47,12 @@ def detect_backend(
             )
         return DetectionResult(
             "ankiconnect",
-            _resolve_direct_collection(col_override),
-            "forced"
+            _resolve_direct_collection(col_override, anki_profile=anki_profile),
+            _reason("forced", anki_profile, col_override),
         )
 
     if forced == "direct":
-        path = _resolve_direct_collection(col_override)
+        path = _resolve_direct_collection(col_override, anki_profile=anki_profile)
         if path is None:
             raise DetectionError(
                 "Direct backend forced, but no Anki collection DB was found.",
@@ -63,7 +64,9 @@ def detect_backend(
                 "Close Anki Desktop or use --backend ankiconnect.",
                 exit_code=7,
             )
-        return DetectionResult("direct", path, "forced")
+        return DetectionResult(
+            "direct", path, _reason("forced", anki_profile, col_override)
+        )
 
     if forced == "standalone":
         return DetectionResult(
@@ -75,11 +78,11 @@ def detect_backend(
     if _ankiconnect_reachable(ankiconnect_url):
         return DetectionResult(
             "ankiconnect",
-            _resolve_direct_collection(col_override),
-            "ankiconnect reachable"
+            _resolve_direct_collection(col_override, anki_profile=anki_profile),
+            _reason("ankiconnect reachable", anki_profile, col_override),
         )
 
-    direct_path = _resolve_direct_collection(col_override)
+    direct_path = _resolve_direct_collection(col_override, anki_profile=anki_profile)
     if direct_path is not None:
         if _anki_process_running() or _sqlite_write_locked(direct_path):
             raise DetectionError(
@@ -90,7 +93,11 @@ def detect_backend(
         return DetectionResult(
             "direct",
             direct_path,
-            "ankiconnect unavailable, direct collection found"
+            _reason(
+                "ankiconnect unavailable, direct collection found",
+                anki_profile,
+                col_override,
+            ),
         )
 
     return DetectionResult(
@@ -110,7 +117,17 @@ def _ankiconnect_reachable(url: str) -> bool:
         return False
     return isinstance(data, dict) and data.get("error") is None and "result" in data
 
-def _resolve_direct_collection(col_override: Path | None) -> Path | None:
+def _reason(base: str, anki_profile: str | None, col_override: Path | None) -> str:
+    """Annotate the detection reason with the profile that won, if one was used."""
+    if anki_profile and col_override is None:
+        return f"{base} (profile '{anki_profile}')"
+    return base
+
+
+def _resolve_direct_collection(
+    col_override: Path | None,
+    anki_profile: str | None = None,
+) -> Path | None:
     if col_override is not None:
         resolved = col_override.expanduser().resolve()
         return resolved if resolved.exists() else None
@@ -130,7 +147,20 @@ def _resolve_direct_collection(col_override: Path | None) -> Path | None:
                 if db_path.exists():
                     candidates.append(db_path)
 
-    return candidates[0] if candidates else None
+    if not candidates:
+        return None
+
+    if anki_profile:
+        for path in candidates:
+            if path.parent.name == anki_profile:
+                return path
+        available = ", ".join(sorted({path.parent.name for path in candidates}))
+        raise DetectionError(
+            f"Anki profile '{anki_profile}' not found. Available: {available}.",
+            exit_code=3,
+        )
+
+    return candidates[0]
 
 
 def _resolve_standalone_collection(col_override: Path | None) -> Path:

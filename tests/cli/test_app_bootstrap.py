@@ -148,6 +148,34 @@ def test_bootstrap_success_passes_context_to_subcommand(monkeypatch) -> None:
     assert obj["backend_reason"] == "forced"
 
 
+def test_bootstrap_forwards_anki_profile_to_detect(monkeypatch) -> None:
+    # Pins the anki_profile= kwarg at the detect_backend call site.
+    _install_dummy_command(monkeypatch)
+
+    runtime = _runtime(backend="direct", output_format="json")
+    runtime.app.collection.anki_profile = "Work"
+    monkeypatch.setattr(app_mod, "resolve_runtime_config", lambda **kwargs: runtime)
+
+    captured: dict[str, Any] = {}
+
+    def fake_detect(**kwargs: Any):
+        captured.update(kwargs)
+        return DetectionResult(
+            backend="direct",
+            collection_path=Path("/tmp/detected.db"),
+            reason="forced",
+        )
+
+    monkeypatch.setattr(app_mod, "detect_backend", fake_detect)
+
+    result = CliRunner().invoke(app_mod.main, ["dummy"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["anki_profile"] == "Work"
+    assert captured["forced_backend"] == "direct"
+    assert captured["col_override"] is None
+
+
 def test_cli_parameter_sources_marked_when_explicit(monkeypatch) -> None:
     _install_dummy_command(monkeypatch)
     captured_kwargs: dict[str, Any] = {}

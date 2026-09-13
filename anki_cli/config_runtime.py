@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import tomllib
 from collections.abc import Mapping
@@ -214,7 +213,7 @@ def _resolve_collection_override(
     cli_collection_path: Path | None,
     cli_collection_set: bool,
     env_collection: str | None,
-    file_collection: str,
+    file_collection: str | None,
     file_data: dict[str, Any],
 ) -> Path | None:
     if cli_collection_set and cli_collection_path is not None:
@@ -226,7 +225,7 @@ def _resolve_collection_override(
             raise ConfigError("ANKI_CLI_COLLECTION is set but empty.")
         return Path(value).expanduser().resolve()
 
-    if _has_nested_key(file_data, "collection", "path"):
+    if _has_nested_key(file_data, "collection", "path") and file_collection is not None:
         return Path(file_collection).expanduser().resolve()
 
     return None
@@ -296,42 +295,19 @@ def _set_nested(data: dict[str, Any], parts: list[str], value: Any) -> None:
 
 
 def _coerce_raw_value(raw_value: str, old_value: Any) -> Any:
+    if old_value is None:
+        # Optional fields (e.g. collection.path, collection.anki_profile)
+        # default to None but are plain strings once set.
+        return raw_value
+
     if isinstance(old_value, bool):
         return _parse_bool_string("value", raw_value)
-
-    if isinstance(old_value, int) and not isinstance(old_value, bool):
-        try:
-            return int(raw_value)
-        except ValueError as exc:
-            raise ConfigError(f"Expected integer, got '{raw_value}'.") from exc
-
-    if isinstance(old_value, float):
-        try:
-            return float(raw_value)
-        except ValueError as exc:
-            raise ConfigError(f"Expected float, got '{raw_value}'.") from exc
 
     if isinstance(old_value, str):
         return raw_value
 
-    if isinstance(old_value, list):
-        try:
-            parsed = json.loads(raw_value)
-        except json.JSONDecodeError as exc:
-            raise ConfigError("Expected JSON list for this key.") from exc
-        if not isinstance(parsed, list):
-            raise ConfigError("Expected JSON list for this key.")
-        return parsed
-
-    if isinstance(old_value, dict):
-        try:
-            parsed = json.loads(raw_value)
-        except json.JSONDecodeError as exc:
-            raise ConfigError("Expected JSON object for this key.") from exc
-        if not isinstance(parsed, dict):
-            raise ConfigError("Expected JSON object for this key.")
-        return parsed
-
+    # No int/float/list/dict fields remain in AppConfig; anything else
+    # (e.g. a key naming a whole section) is rejected here.
     raise ConfigError(f"Unsupported value type for config update: {type(old_value).__name__}.")
 
 
@@ -347,13 +323,15 @@ def _write_config_file(path: Path, app_config: AppConfig) -> None:
 def _serialize_config_toml(app_config: AppConfig) -> str:
     data = app_config.model_dump(mode="python")
 
-    sections = ["collection", "backend", "display", "backup", "review"]
+    sections = list(data)
     lines: list[str] = []
 
     for idx, section in enumerate(sections):
         section_data = data.get(section, {})
         lines.append(f"[{section}]")
         for key, value in section_data.items():
+            if value is None:
+                continue
             lines.append(f"{key} = {_toml_scalar(value)}")
         if idx != len(sections) - 1:
             lines.append("")
