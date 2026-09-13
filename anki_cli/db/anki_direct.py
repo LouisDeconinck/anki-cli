@@ -1216,17 +1216,28 @@ class AnkiDirectReadStore:
                 ),
             ).rowcount
 
-            # Manual revlog entry; we never delete revlog.
-            revlog_id = self._allocate_epoch_ms_id(conn, "revlog")
-            conn.execute(
-                """
-                INSERT INTO revlog (id, cid, usn, ease, ivl, lastIvl, factor, time, type)
-                VALUES (?, ?, -1, 0, 0, 0, 0, 0, 4)
-                """,
-                (revlog_id, card_id),
-            )
+            # Match Anki's undo semantics: delete the exact revlog row the
+            # undone review wrote (its id is recorded in the snapshot when the
+            # undo entry is pushed) instead of appending a compensating row.
+            # Without this the review's own ease 1..4 row survives and
+            # _seed_fsrs_card_from_revlog keeps picking it up, so legacy cards
+            # seeded from revlog compute a different stability afterwards.
+            # usn = -1 restricts the delete to rows that have not synced yet;
+            # revlog deletions never propagate to AnkiWeb, so removing a
+            # synced row would diverge this collection from the server.
+            revlog_id = snapshot.get("revlog_id")
+            revlog_deleted = 0
+            if isinstance(revlog_id, int) and not isinstance(revlog_id, bool):
+                revlog_deleted = conn.execute(
+                    "DELETE FROM revlog WHERE id = ? AND cid = ? AND usn = -1",
+                    (revlog_id, card_id),
+                ).rowcount
 
-        return {"card_id": card_id, "restored": int(updated) > 0, "revlog_id": revlog_id}
+        return {
+            "card_id": card_id,
+            "restored": int(updated) > 0,
+            "revlog_deleted": int(revlog_deleted),
+        }
 
 
     def preview_ratings(self, card_id: int) -> list[dict[str, JSONValue]]:
@@ -2517,6 +2528,7 @@ class AnkiDirectReadStore:
             "type": new_type,
             "due": new_due,
             "interval": new_ivl,
+            "revlog_id": revlog_id,
         }
 
     # ---- SQL query helpers ------------------------------------------------

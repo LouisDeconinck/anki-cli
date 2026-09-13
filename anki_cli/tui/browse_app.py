@@ -522,20 +522,19 @@ class BrowseApp(App[None]):
     """
 
     BINDINGS: ClassVar[list[Binding]] = [
-        Binding("q", "quit", "Quit", show=False),
-        Binding("escape", "quit", "Quit", show=False),
-        Binding("slash", "focus_search", "Search", key_display="/", show=False),
-        Binding("r", "refresh", "Refresh", show=False),
-        Binding("tab", "cycle_filter", "Cycle filter", show=False),
+        Binding("slash", "focus_search", "Search", key_display="/", show=True),
+        Binding("tab", "cycle_filter", "Cycle filter", key_display="Tab", show=True),
         Binding("1", "filter_all", "All", show=False),
         Binding("2", "filter_new", "New", show=False),
         Binding("3", "filter_review", "Review", show=False),
         Binding("4", "filter_learn", "Learn", show=False),
         Binding("5", "filter_suspended", "Suspended", show=False),
-        Binding("enter", "show_detail", "Detail", show=False),
-        Binding("e", "edit_selected", "Edit", show=False),
-        Binding("d", "delete_selected", "Delete", show=False),
-        Binding("s", "suspend_selected", "Suspend", show=False),
+        Binding("enter", "show_detail", "Detail", key_display="Enter", show=True),
+        Binding("d", "delete_selected", "Delete", show=True),
+        Binding("s", "suspend_selected", "Suspend", show=True),
+        Binding("r", "refresh", "Refresh", show=True),
+        Binding("q", "quit", "Quit", show=True),
+        Binding("escape", "quit", "Quit", show=False),
     ]
 
     _FILTER_ORDER: ClassVar[tuple[str, ...]] = ("all", "new", "review", "learn", "suspended")
@@ -640,14 +639,6 @@ class BrowseApp(App[None]):
         row_idx = self._selected_row_index()
         if row_idx >= 0:
             self._show_detail_for_row(row_idx)
-
-    def action_edit_selected(self) -> None:
-        card = self._selected_card()
-        if card is None:
-            self._set_status("no card selected", self._count_label())
-            return
-        self._set_status("edit UI not implemented yet - showing detail", self._count_label())
-        self.action_show_detail()
 
     def action_suspend_selected(self) -> None:
         card = self._selected_card()
@@ -812,19 +803,18 @@ class BrowseApp(App[None]):
         self.query_one("#toolbar-count", Static).update(count)
 
     def _render_hint_bar(self) -> None:
+        # Derive the bar from BINDINGS so it can only advertise keys that
+        # actually do something.
         hint = Text()
-        shortcuts = [
-            ("/", "search"), ("↑↓", "navigate"), ("e", "edit"),
-            ("a", "add"), ("Tab", "filter"),
-        ]
-        for i, (key, label) in enumerate(shortcuts):
-            if i > 0:
+        first = True
+        for binding in self.BINDINGS:
+            if not binding.show:
+                continue
+            if not first:
                 hint.append("   ")
-            hint.append(f" {key} ", style=f"bold {BLUE}")
-            hint.append(f" {label}", style=DIM)
-        hint.append("   ")
-        hint.append(" q ", style=f"bold {BLUE}")
-        hint.append(" back", style=DIM)
+            hint.append(f" {binding.key_display or binding.key} ", style=f"bold {BLUE}")
+            hint.append(f" {binding.description}", style=DIM)
+            first = False
         self.query_one("#hintbar", Static).update(hint)
 
     def _sync_preview_cursor(self, force: bool = False) -> None:
@@ -841,7 +831,7 @@ class BrowseApp(App[None]):
         self.query_one("#preview-body", Static).update("No card selected.")
         self.query_one("#preview-meta", Static).update("")
         actions = Text()
-        for key, label in [("e", "Edit"), ("d", "Delete"), ("s", "Suspend"), ("Enter", "Study")]:
+        for key, label in [("d", "Delete"), ("s", "Suspend"), ("Enter", "Detail")]:
             actions.append(f" {key} ", style=f"bold {BLUE}")
             actions.append(f" {label}  ", style=DIM)
         self.query_one("#preview-actions", Static).update(actions)
@@ -901,7 +891,7 @@ class BrowseApp(App[None]):
 
         suspend_label = "Unsuspend" if _to_int(card.get("queue"), 0) == -1 else "Suspend"
         actions = Text()
-        action_items = [("e", "Edit"), ("d", "Delete"), ("s", suspend_label), ("Enter", "Study")]
+        action_items = [("d", "Delete"), ("s", suspend_label), ("Enter", "Detail")]
         for key, label in action_items:
             actions.append(f" {key} ", style=f"bold {BLUE}")
             actions.append(f" {label}  ", style=DIM)

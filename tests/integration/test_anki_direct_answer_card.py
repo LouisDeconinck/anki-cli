@@ -197,6 +197,7 @@ def test_answer_card_updates_card_and_writes_revlog_non_lapse(
         "type": 2,
         "due": 33,
         "interval": 44,
+        "revlog_id": 9001,
     }
 
     row = _card_row(db_path, 100)

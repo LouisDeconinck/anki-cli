@@ -251,6 +251,7 @@ For other AI coding agents, point them at `SKILL.md` in the repo root or include
 - Use `--yes` for destructive operations (`note:delete`, `deck:delete`, `notetype:field:remove`).
 - In direct mode, avoid write operations while Anki Desktop is open.
 - If Anki Desktop is running, prefer `--backend ankiconnect`.
+- `review:undo` (direct mode only) restores the card's previous state and deletes the revlog row written by the undone answer, matching Anki's own undo.
 
 ## Development
 
