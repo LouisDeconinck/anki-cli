@@ -78,6 +78,18 @@ Collection override (direct backend):
 anki --backend direct --col "/path/to/collection.anki2" status
 ```
 
+Anki profile selection (for multi-profile installs):
+
+```toml
+# ~/.config/anki-cli/config.toml
+[collection]
+anki_profile = "Work"
+```
+
+When set, collection discovery picks `<Anki2>/<anki_profile>/collection.anki2`
+instead of the first profile found. A name matching no profile exits with code
+3 and lists the available profiles; `--col` takes precedence over it entirely.
+
 Backend behavior:
 
 - `auto`: detects and chooses best available backend
@@ -217,6 +229,7 @@ Exit codes:
 - `0`: success
 - `1`: backend operation failed
 - `2`: invalid input or confirmation required
+- `3`: no Anki backend found (auto mode could not reach AnkiConnect or find a collection)
 - `4`: entity not found
 - `7`: backend unavailable
 
