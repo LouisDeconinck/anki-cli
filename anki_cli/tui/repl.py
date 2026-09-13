@@ -19,6 +19,7 @@ from prompt_toolkit.styles import Style
 from rich import box
 from rich.console import Console, Group
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.panel import Panel
 from rich.progress_bar import ProgressBar
 from rich.table import Table
@@ -26,7 +27,7 @@ from rich.text import Text
 
 from anki_cli import __version__
 from anki_cli.cli.dispatcher import get_command, list_commands
-from anki_cli.cli.params import preprocess_argv
+from anki_cli.cli.params import option_arity, preprocess_argv
 
 from .colors import (
     BLUE,
@@ -187,7 +188,11 @@ def _invoke_command(ctx_obj: dict[str, Any], raw_args: list[str]) -> None:
     if not raw_args:
         return
 
-    args = preprocess_argv(raw_args)
+    def _options_for(name: str):
+        cmd = get_command(_ALIASES.get(name, name))
+        return option_arity(cmd) if cmd is not None else None
+
+    args = preprocess_argv(raw_args, resolve_command_options=_options_for)
     cmd_name = _ALIASES.get(args[0], args[0])
     cmd_args = args[1:]
 
@@ -458,7 +463,7 @@ def _inline_review(ctx_obj: dict[str, Any], deck: str | None) -> None:
                             console.print(f"  [{DIM}](undone)[/]")
                         except Exception as exc:
                             console.print(
-                                f"  [{RED}]undo failed:[/] {exc}"
+                                f"  [{RED}]undo failed:[/] {escape(str(exc))}"
                             )
                     else:
                         console.print(
@@ -475,33 +480,56 @@ def _inline_review(ctx_obj: dict[str, Any], deck: str | None) -> None:
                     console.print(f"  [{DIM}](1/2/3/4/u/q)[/]")
                     continue
 
+                snapshot: dict[str, Any] | None = None
+                collection = ""
                 if (
                     getattr(backend, "name", "") == "direct"
                     and hasattr(backend, "_store")
                 ):
                     col = getattr(backend, "collection_path", None)
                     collection = str(col) if col is not None else ""
-                    snap = cast(
-                        Any, backend._store
-                    ).snapshot_card_state(int(card_id))
-                    undo.push(UndoItem(
-                        collection=collection,
-                        card_id=int(card_id),
-                        snapshot=cast(dict[str, Any], snap),
-                        created_at_epoch_ms=now_epoch_ms(),
-                    ))
+                    snapshot = cast(
+                        dict[str, Any],
+                        cast(Any, backend._store).snapshot_card_state(int(card_id)),
+                    )
 
                 try:
-                    backend.answer_card(
+                    result = backend.answer_card(
                         card_id=int(card_id), ease=ease
                     )
+                except Exception as exc:
+                    msg = str(exc) or type(exc).__name__
+                    console.print(f"  [{RED}]answer failed:[/] {escape(msg)}")
+                else:
+                    # Push only after a successful answer so a failed answer
+                    # cannot leave a stale undo entry. The snapshot carries
+                    # the id of the revlog row this answer wrote so undo can
+                    # delete exactly that row instead of a time window.
+                    if snapshot is not None:
+                        revlog_id = (
+                            result.get("revlog_id")
+                            if isinstance(result, Mapping)
+                            else None
+                        )
+                        undo_item = UndoItem(
+                            collection=collection,
+                            card_id=int(card_id),
+                            snapshot={**snapshot, "revlog_id": revlog_id},
+                            created_at_epoch_ms=now_epoch_ms(),
+                        )
+                        # Best-effort: the answer is already committed, so a
+                        # failed undo write must not escape the loop.
+                        try:
+                            undo.push(undo_item)
+                        except OSError as exc:
+                            console.print(
+                                f"  [{DIM}]answered; undo not saved: "
+                                f"{escape(str(exc))}[/]"
+                            )
                     reviewed += 1
                     console.print(
                         f"  [{DIM}]rated {ease}  (reviewed={reviewed})[/]"
                     )
-                except Exception as exc:
-                    msg = str(exc) or type(exc).__name__
-                    console.print(f"  [{RED}]answer failed:[/] {msg}")
                 break
 
     finally:

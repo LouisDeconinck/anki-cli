@@ -17,10 +17,27 @@ def _make_store(tmp_path: Path, *, col_crt: int = 0) -> tuple[AnkiDirectReadStor
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     conn = sqlite3.connect(str(db_path))
-    conn.executescript(
-        """
+    conn.executescript("""
         CREATE TABLE col (
             crt INTEGER NOT NULL
+        );
+
+        CREATE TABLE decks (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            kind BLOB NOT NULL
+        );
+
+        CREATE TABLE revlog (
+            id INTEGER PRIMARY KEY,
+            cid INTEGER NOT NULL,
+            usn INTEGER NOT NULL,
+            ease INTEGER NOT NULL,
+            ivl INTEGER NOT NULL,
+            lastIvl INTEGER NOT NULL,
+            factor INTEGER NOT NULL,
+            time INTEGER NOT NULL,
+            type INTEGER NOT NULL
         );
 
         CREATE TABLE cards (
@@ -43,8 +60,7 @@ def _make_store(tmp_path: Path, *, col_crt: int = 0) -> tuple[AnkiDirectReadStor
             flags INTEGER NOT NULL,
             data TEXT NOT NULL
         );
-        """
-    )
+        """)
     conn.execute("INSERT INTO col (crt) VALUES (?)", (col_crt,))
     conn.commit()
     conn.close()
@@ -63,6 +79,8 @@ def _insert_card(
     due: int = 5,
     ivl: int = 10,
     factor: int = 2500,
+    odue: int = 0,
+    odid: int = 0,
 ) -> None:
     conn = sqlite3.connect(str(db_path))
     conn.execute(
@@ -77,20 +95,20 @@ def _insert_card(
             card_id,
             1000,  # nid
             did,
-            0,     # ord
+            0,  # ord
             mod,
-            0,     # usn
+            0,  # usn
             card_type,
             queue,
             due,
             ivl,
             factor,
-            1,     # reps
-            0,     # lapses
-            0,     # left
-            0,     # odue
-            0,     # odid
-            0,     # flags
+            1,  # reps
+            0,  # lapses
+            0,  # left
+            odue,
+            odid,
+            0,  # flags
             "{}",
         ),
     )
@@ -132,7 +150,7 @@ def test_preview_ratings_returns_four_ease_options_with_decoded_due_info(
     monkeypatch.setattr(
         store,
         "_card_row_to_fsrs",
-        lambda row, *, col_crt_sec, now_dt: SimpleNamespace(
+        lambda row, *, timing, now_dt, **_steps: SimpleNamespace(
             state=direct_mod.State.Review,
             step=None,
             stability=None,
@@ -183,11 +201,13 @@ def test_preview_ratings_returns_four_ease_options_with_decoded_due_info(
     assert out[2]["type"] == 2
     assert out[2]["queue"] == 2
     assert out[2]["interval"] == 12
+    today = store._today_due_index(int(direct_mod.time.time()))
     assert out[2]["due_info"] == {
         "kind": "review_day_index",
         "raw": 5,
         "day_index": 5,
         "epoch_secs": (10 + 5) * 86400,
+        "days_from_today": 5 - today,
     }
 
     assert out[3]["type"] == 2
@@ -198,6 +218,7 @@ def test_preview_ratings_returns_four_ease_options_with_decoded_due_info(
         "raw": 6,
         "day_index": 6,
         "epoch_secs": (10 + 6) * 86400,
+        "days_from_today": 6 - today,
     }
 
 
@@ -223,7 +244,7 @@ def test_preview_ratings_sets_relearning_step_zero_when_missing(
     monkeypatch.setattr(
         store,
         "_card_row_to_fsrs",
-        lambda row, *, col_crt_sec, now_dt: SimpleNamespace(
+        lambda row, *, timing, now_dt, **_steps: SimpleNamespace(
             state=direct_mod.State.Relearning,
             step=None,
             stability=2.0,
@@ -275,7 +296,7 @@ def test_preview_ratings_falls_back_when_seed_unavailable(
     monkeypatch.setattr(
         store,
         "_card_row_to_fsrs",
-        lambda row, *, col_crt_sec, now_dt: SimpleNamespace(
+        lambda row, *, timing, now_dt, **_steps: SimpleNamespace(
             state=direct_mod.State.Review,
             step=0,
             stability=None,
@@ -297,3 +318,21 @@ def test_preview_ratings_falls_back_when_seed_unavailable(
     assert observed["difficulty"] is not None
     assert 1.0 <= float(observed["difficulty"]) <= 10.0
     assert observed["last_review"] is not None
+
+
+def test_preview_ratings_refuses_a_card_in_a_preview_filtered_deck(tmp_path: Path) -> None:
+    """Mirrors answer_card: don't offer ratings that answering would then refuse."""
+    from anki_cli.proto.anki.decks import DeckFiltered, DeckKindContainer
+
+    store, db_path = _make_store(tmp_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "INSERT INTO decks (id, name, kind) VALUES (555, 'Preview', ?)",
+        (bytes(DeckKindContainer(filtered=DeckFiltered(reschedule=False))),),
+    )
+    conn.commit()
+    conn.close()
+    _insert_card(db_path, card_id=100, did=555, odid=1, odue=5, due=-7)
+
+    with pytest.raises(ValueError, match="preview"):
+        store.preview_ratings(100)

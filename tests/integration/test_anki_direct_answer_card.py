@@ -10,6 +10,7 @@ import pytest
 
 import anki_cli.db.anki_direct as direct_mod
 from anki_cli.db.anki_direct import AnkiDirectReadStore
+from anki_cli.proto.anki.decks import DeckFiltered, DeckKindContainer, DeckNormal
 from tests.integration.conftest import COL_TABLE_SQL, insert_col_row
 
 
@@ -38,6 +39,12 @@ def _make_store(tmp_path: Path) -> tuple[AnkiDirectReadStore, Path]:
             odid INTEGER NOT NULL,
             flags INTEGER NOT NULL,
             data TEXT NOT NULL
+        );
+
+        CREATE TABLE decks (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            kind BLOB NOT NULL
         );
 
         CREATE TABLE revlog (
@@ -94,7 +101,7 @@ def _card_row(db_path: Path, card_id: int) -> dict[str, Any]:
     conn.row_factory = sqlite3.Row
     row = conn.execute(
         """
-        SELECT id, did, ord, type, queue, due, ivl, factor,
+        SELECT id, did, odid, odue, ord, type, queue, due, ivl, factor,
                reps, lapses, left, flags, data, mod, usn
         FROM cards
         WHERE id = ?
@@ -166,7 +173,7 @@ def test_answer_card_updates_card_and_writes_revlog_non_lapse(
     monkeypatch.setattr(
         store,
         "_card_row_to_fsrs",
-        lambda row, *, col_crt_sec, now_dt: SimpleNamespace(
+        lambda row, *, timing, now_dt, **_steps: SimpleNamespace(
             state=direct_mod.State.Learning,
             step=0,
             stability=None,
@@ -186,10 +193,12 @@ def test_answer_card_updates_card_and_writes_revlog_non_lapse(
         "card_id": 100,
         "ease": 3,
         "answered": True,
+        "fsrs_params": "unknown",  # fixture has no deck_config table
         "queue": 2,
         "type": 2,
         "due": 33,
         "interval": 44,
+        "revlog_id": 9001,
     }
 
     row = _card_row(db_path, 100)
@@ -208,7 +217,7 @@ def test_answer_card_updates_card_and_writes_revlog_non_lapse(
     assert data["dr"] == 0.9
     assert data["s"] == 3.2
     assert data["d"] == 6.7
-    assert data["lrt"] == row["mod"]
+    assert data["lrt"] == row["mod"]  # rslib CardData.last_review_time, seconds
 
     revlog = _revlog_rows(db_path)
     assert revlog == [
@@ -257,7 +266,7 @@ def test_answer_card_lapse_increments_lapses_and_sets_relearn_type(
     monkeypatch.setattr(
         store,
         "_card_row_to_fsrs",
-        lambda row, *, col_crt_sec, now_dt: SimpleNamespace(
+        lambda row, *, timing, now_dt, **_steps: SimpleNamespace(
             state=direct_mod.State.Learning,
             step=0,
             stability=None,
@@ -294,7 +303,10 @@ def test_answer_card_lapse_increments_lapses_and_sets_relearn_type(
             "lastIvl": 10,
             "factor": 550,
             "time": 0,
-            "type": 2,  # relearn
+            # rslib RevlogReviewKind is the card's state *before* the answer: a
+            # review card answered Again is still logged as Review (1), and the
+            # relearning kind (2) is only used once the card is in relearning.
+            "type": 1,
         }
     ]
 
@@ -367,3 +379,140 @@ def test_answer_card_day_learn_step_writes_day_index_and_positive_revlog_ivl(
     (entry,) = _revlog_rows(db_path)
     assert entry["ivl"] == 2  # positive days for day-learn
     assert entry["lastIvl"] == 1  # previous due was today + 1
+
+
+# --- filtered-deck awareness (#20) --------------------------------------------
+
+
+def _insert_deck(db_path: Path, *, did: int, name: str, filtered: bool, reschedule: bool = True):
+    kind = (
+        DeckKindContainer(filtered=DeckFiltered(reschedule=reschedule))
+        if filtered
+        else DeckKindContainer(normal=DeckNormal(config_id=1))
+    )
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("INSERT INTO decks (id, name, kind) VALUES (?, ?, ?)", (did, name, bytes(kind)))
+    conn.commit()
+    conn.close()
+
+
+def _park_card_in_filtered_deck(db_path: Path, *, filtered_did: int, home_did: int, odue: int):
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "UPDATE cards SET did = ?, odid = ?, odue = ?, due = -7 WHERE id = 100",
+        (filtered_did, home_did, odue),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _fake_scheduler(monkeypatch: pytest.MonkeyPatch, store: AnkiDirectReadStore, captured: dict):
+    class FakeScheduler:
+        def review_card(self, card, rating, review_datetime):
+            captured["fsrs_due"] = card.due
+            return SimpleNamespace(stability=3.2, difficulty=6.7), None
+
+    def build(conn, deck_id):
+        captured["scheduler_deck"] = deck_id
+        return FakeScheduler(), 0.9, 2, 1
+
+    monkeypatch.setattr(store, "_build_scheduler", build)
+    monkeypatch.setattr(
+        store,
+        "_map_fsrs_result_to_anki",
+        lambda **kwargs: (2, 2, 33, 44, 0, 123456),
+    )
+
+
+def test_answer_card_in_rescheduling_filtered_deck_sends_it_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Anki v3: remove_from_filtered_deck_before_reschedule, then schedule normally."""
+    store, db_path = _make_store(tmp_path)
+    monkeypatch.setattr(store, "_ensure_write_safe", lambda: None)
+    monkeypatch.setattr(store, "_allocate_epoch_ms_id", lambda conn, table: 9010)
+    _insert_deck(db_path, did=1, name="Home", filtered=False)
+    _insert_deck(db_path, did=555, name="Cram", filtered=True, reschedule=True)
+    _park_card_in_filtered_deck(db_path, filtered_did=555, home_did=1, odue=30)
+    captured: dict = {}
+    _fake_scheduler(monkeypatch, store, captured)
+
+    store.answer_card(100, ease=3)
+
+    row = _card_row(db_path, 100)
+    assert (row["did"], row["odid"], row["odue"]) == (1, 0, 0)
+    assert (row["type"], row["queue"], row["due"]) == (2, 2, 33)
+    # Options come from the home deck, and FSRS saw the real due (odue = day 30
+    # after crt 0), not the filtered-deck position -7.
+    assert captured["scheduler_deck"] == 1
+    assert captured["fsrs_due"] == direct_mod.datetime.fromtimestamp(30 * 86400, tz=direct_mod.UTC)
+
+
+def test_answer_card_in_preview_filtered_deck_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store, db_path = _make_store(tmp_path)
+    monkeypatch.setattr(store, "_ensure_write_safe", lambda: None)
+    _insert_deck(db_path, did=1, name="Home", filtered=False)
+    _insert_deck(db_path, did=555, name="Preview", filtered=True, reschedule=False)
+    _park_card_in_filtered_deck(db_path, filtered_did=555, home_did=1, odue=30)
+    before = _card_row(db_path, 100)
+
+    with pytest.raises(ValueError, match="preview"):
+        store.answer_card(100, ease=3)
+
+    assert _card_row(db_path, 100) == before
+    assert _revlog_rows(db_path) == []
+
+
+def test_undo_restores_filtered_deck_membership(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """snapshot -> answer (card goes home) -> restore must put it back on loan."""
+    store, db_path = _make_store(tmp_path)
+    monkeypatch.setattr(store, "_ensure_write_safe", lambda: None)
+    ids = iter([9011, 9012])
+    monkeypatch.setattr(store, "_allocate_epoch_ms_id", lambda conn, table: next(ids))
+    _insert_deck(db_path, did=1, name="Home", filtered=False)
+    _insert_deck(db_path, did=555, name="Cram", filtered=True)
+    _park_card_in_filtered_deck(db_path, filtered_did=555, home_did=1, odue=30)
+    _fake_scheduler(monkeypatch, store, {})
+
+    snapshot = store.snapshot_card_state(100)
+    assert (snapshot["did"], snapshot["odid"], snapshot["odue"]) == (555, 1, 30)
+
+    store.answer_card(100, ease=3)
+    assert _card_row(db_path, 100)["did"] == 1
+
+    store.restore_card_state(snapshot)
+
+    row = _card_row(db_path, 100)
+    assert (row["did"], row["odid"], row["odue"], row["due"]) == (555, 1, 30, -7)
+
+
+def test_answer_card_new_card_on_loan_records_original_position(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """data.pos must be the new-queue position (odue), not the filtered-deck slot."""
+    store, db_path = _make_store(tmp_path)
+    monkeypatch.setattr(store, "_ensure_write_safe", lambda: None)
+    monkeypatch.setattr(store, "_allocate_epoch_ms_id", lambda conn, table: 9020)
+    _insert_deck(db_path, did=1, name="Home", filtered=False)
+    _insert_deck(db_path, did=555, name="Cram", filtered=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "UPDATE cards SET type = 0, queue = 0, did = 555, odid = 1, odue = 12, due = -99999 "
+        "WHERE id = 100"
+    )
+    conn.commit()
+    conn.close()
+    _fake_scheduler(monkeypatch, store, {})
+
+    store.answer_card(100, ease=3)
+
+    data = json.loads(_card_row(db_path, 100)["data"])
+    assert data["pos"] == 12

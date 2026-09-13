@@ -124,6 +124,23 @@ anki note:add --deck "Default" --notetype "Basic" --Front "Q" --Back "A" --tags 
 
 Field names are passed as dynamic CLI options matching the notetype's field names.
 
+Both backends apply Anki's own add-time checks and refuse with `BACKEND_OPERATION_FAILED`
+(exit 1):
+
+- **Duplicate** — the first field matches an existing note of the same notetype. Pass
+  `--allow-duplicate` to add it anyway. On the direct backend `details.duplicate_ids`
+  lists the matching note ids; AnkiConnect reports the duplicate without ids.
+- **Empty** — the first field is empty once markup is ignored (`""`, whitespace, `<br>`).
+  `--allow-duplicate` does not lift this.
+
+In `note:bulk`, per-item refusals (duplicate, empty, unknown deck/notetype/field) come back
+as `null` ids and are counted in `failed`; the other items still land. Each item commits on
+its own, so a repeated first field *within* the batch is also a duplicate; pass
+`--allow-duplicate` to `note:bulk` to insert repeats (re-running an import file). A failure that would
+hit every item the same way (Anki Desktop holding the collection, a corrupt notetype) fails
+the whole command with `BACKEND_OPERATION_FAILED` instead — so `null` never means "the
+collection was unavailable".
+
 ### Bulk Adding Notes
 
 Accepts JSON array from stdin or a file:
@@ -313,4 +330,4 @@ anki --format json status
 - Destructive commands (`note:delete`, `deck:delete`) require `--yes` or will exit with code 2 and `CONFIRMATION_REQUIRED`.
 - Avoid direct-backend writes while Anki Desktop has the collection open.
 - Use `--backend ankiconnect` when Anki Desktop is running.
-- `review:undo` only works with the direct backend and only undoes the last answer.
+- `review:undo` only works with the direct backend and only undoes the last answer. It restores the card's previous state and deletes the revlog row written by the undone answer (matching Anki's own undo); a row that already synced to AnkiWeb is left in place.

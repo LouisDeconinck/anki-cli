@@ -151,6 +151,7 @@ anki card:revlog --id 123 --limit 20
 anki notes --query "deck:Default"
 anki note --id 123
 anki note:add --deck "Default" --notetype "Basic" --Front "Q" --Back "A"
+anki note:add --deck "Default" --notetype "Basic" --Front "Q" --Back "A2" --allow-duplicate
 anki note:edit --id 123 --Front "Updated Q" --Back "Updated A"
 anki note:fields --id 123
 anki note:delete --id 123 --yes
@@ -159,6 +160,10 @@ anki tag:add --query "deck:Default" --tag "important"
 anki tag:remove --id 123 --tag "important"
 anki tag:rename --from "old" --to "new"
 ```
+
+Like Anki's own Add dialog, `note:add` refuses a note whose first field already exists in
+the same notetype (exit 1) or is empty. `--allow-duplicate` lifts the duplicate check; it
+also works on `note:bulk`, where refused items otherwise come back as `null` ids.
 
 ### Decks and notetypes
 
@@ -251,6 +256,7 @@ For other AI coding agents, point them at `SKILL.md` in the repo root or include
 - Use `--yes` for destructive operations (`note:delete`, `deck:delete`, `notetype:field:remove`).
 - In direct mode, avoid write operations while Anki Desktop is open.
 - If Anki Desktop is running, prefer `--backend ankiconnect`.
+- `review:undo` (direct mode only) restores the card's previous state and deletes the revlog row written by the undone answer, matching Anki's own undo.
 - In direct mode, `csum` for notes with HTML in the first field now matches Anki. Rows written by older anki-cli versions keep their old csum until Tools ▸ Check Database recomputes them; duplicate detection may miss them until then.
 
 ## Development

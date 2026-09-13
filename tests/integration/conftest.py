@@ -56,6 +56,7 @@ CSUM_IMG_Y_JPG = 1_649_267_424  # " y.jpg "
 CSUM_IMG_Z_GIF = 2_472_787_776  # " z.gif "
 CSUM_AUDIO_A_MP3 = 1_622_132_994  # " a.mp3 "
 CSUM_OBJECT_O_SWF = 3_231_323_113  # " o.swf "
+CSUM_VIDEO_V_MP4 = 985_886_235  # " v.mp4 "
 CSUM_TEST = 2_840_236_005  # rslib vector: "test"
 CSUM_KYOU = 1_464_653_051  # rslib vector: "今日"
 # Strict-decode cases: a malformed entity makes htmlescape keep the ENTIRE
