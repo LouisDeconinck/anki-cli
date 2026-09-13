@@ -31,9 +31,9 @@ def _base_obj(**overrides: Any) -> dict[str, Any]:
 
 
 def _invoke_success_json(
-    command, 
-    *, 
-    args: list[str] | None = None, 
+    command,
+    *,
+    args: list[str] | None = None,
     obj: dict[str, Any]
 ) -> dict[str, Any]:
     runner = CliRunner()
@@ -46,9 +46,9 @@ def _invoke_success_json(
 
 
 def _invoke_error_json(
-    command, 
-    *, 
-    args: list[str], 
+    command,
+    *,
+    args: list[str],
     obj: dict[str, Any]
 ) -> tuple[Any, dict[str, Any]]:
     runner = CliRunner()
@@ -133,7 +133,7 @@ def test_config_path_cmd_uses_context_paths() -> None:
 
 def test_config_path_cmd_defaults_when_paths_absent() -> None:
     payload = _invoke_success_json(
-        config_path_cmd, 
+        config_path_cmd,
         obj=_base_obj(collection_path=None, config_path=None)
     )
     data = payload["data"]

@@ -1184,8 +1184,8 @@ class AnkiDirectReadStore:
             col_crt_sec = int(col_row["crt"]) if col_row is not None else int(time.time())
 
             (
-                scheduler, 
-                _dr, 
+                scheduler,
+                _dr,
                 learn_count,
                 relearn_count
             ) = self._build_scheduler(conn, int(row["did"]))
@@ -1877,7 +1877,7 @@ class AnkiDirectReadStore:
                 (csum,),
             ).fetchall()
             dup_ids = [int(r["id"]) for r in dup_rows]
-            
+
             if dup_ids and not allow_duplicate:
                 import sys
                 sys.stderr.write(
@@ -2961,24 +2961,24 @@ class AnkiDirectReadStore:
             raise ValueError(
                 f"Failed to decode protobuf for {context} ({len(blob)} bytes)."
             ) from exc
-    
-    
+
+
     def _decode_notetype_config(self, blob: bytes, *, ntid: int) -> NotetypeConfig:
         return self._decode_message(
             NotetypeConfig(),
             blob,
             context=f"notetypes.config ntid={ntid}",
         )
-    
-    
+
+
     def _decode_field_config(self, blob: bytes, *, ntid: int, ord_: int) -> NotetypeFieldConfig:
         return self._decode_message(
             NotetypeFieldConfig(),
             blob,
             context=f"fields.config ntid={ntid} ord={ord_}",
         )
-    
-    
+
+
     def _decode_template_config(
         self, blob: bytes, *, ntid: int, ord_: int
     ) -> NotetypeTemplateConfig:
@@ -2987,32 +2987,32 @@ class AnkiDirectReadStore:
             blob,
             context=f"templates.config ntid={ntid} ord={ord_}",
         )
-    
-    
+
+
     def _decode_deck_common(self, blob: bytes, *, did: int) -> DeckCommon:
         return self._decode_message(
             DeckCommon(),
             blob,
             context=f"decks.common did={did}",
         )
-    
-    
+
+
     def _decode_deck_kind(self, blob: bytes, *, did: int) -> DeckKindContainer:
         return self._decode_message(
             DeckKindContainer(),
             blob,
             context=f"decks.kind did={did}",
         )
-    
-    
+
+
     def _decode_deck_config(self, blob: bytes, *, dcid: int) -> DeckConfigConfig:
         return self._decode_message(
             DeckConfigConfig(),
             blob,
             context=f"deck_config.config id={dcid}",
         )
-    
-    
+
+
     def _load_notetype_parts(
         self,
         conn: sqlite3.Connection,
@@ -3022,7 +3022,7 @@ class AnkiDirectReadStore:
     ]:
         fields_by_ntid: dict[int, list[dict[str, JSONValue]]] = {}
         templates_by_ntid: dict[int, list[dict[str, JSONValue]]] = {}
-    
+
         field_rows = conn.execute(
             """
             SELECT ntid, ord, name, config
@@ -3030,14 +3030,14 @@ class AnkiDirectReadStore:
             ORDER BY ntid, ord
             """
         ).fetchall()
-    
+
         for row in field_rows:
             ntid = int(row["ntid"])
             ord_ = int(row["ord"])
             name = str(row["name"])
             cfg_blob = bytes(row["config"] or b"")
             cfg = self._decode_field_config(cfg_blob, ntid=ntid, ord_=ord_)
-    
+
             fields_by_ntid.setdefault(ntid, []).append(
                 {
                     "ord": ord_,
@@ -3049,7 +3049,7 @@ class AnkiDirectReadStore:
                     "plain_text": bool(cfg.plain_text),
                 }
             )
-    
+
         template_rows = conn.execute(
             """
             SELECT ntid, ord, name, config
@@ -3057,14 +3057,14 @@ class AnkiDirectReadStore:
             ORDER BY ntid, ord
             """
         ).fetchall()
-    
+
         for row in template_rows:
             ntid = int(row["ntid"])
             ord_ = int(row["ord"])
             name = str(row["name"])
             cfg_blob = bytes(row["config"] or b"")
             cfg = self._decode_template_config(cfg_blob, ntid=ntid, ord_=ord_)
-    
+
             templates_by_ntid.setdefault(ntid, []).append(
                 {
                     "ord": ord_,
@@ -3075,10 +3075,10 @@ class AnkiDirectReadStore:
                     "afmt_browser": cfg.a_format_browser,
                 }
             )
-    
+
         return fields_by_ntid, templates_by_ntid
-    
-    
+
+
     def _read_deck_config_map(
         self,
         conn: sqlite3.Connection,
@@ -3090,7 +3090,7 @@ class AnkiDirectReadStore:
             ORDER BY id
             """
         ).fetchall()
-    
+
         out: dict[int, dict[str, JSONValue]] = {}
         for row in rows:
             dcid = int(row["id"])
@@ -3172,7 +3172,7 @@ class AnkiDirectReadStore:
         last_interval_raw = int(row["lastIvl"])
         factor_raw = int(row["factor"])
         review_type = int(row["type"])
-    
+
         return {
             "id": review_id,
             "card_id": int(row["cid"]),
@@ -3188,8 +3188,8 @@ class AnkiDirectReadStore:
             "factor": factor_raw,
             "factor_info": self._decode_revlog_factor(factor_raw),
         }
-    
-    
+
+
     def _decode_revlog_interval(self, value: int) -> dict[str, JSONValue]:
         # Anki convention: negative => seconds, positive => days.
         if value < 0:
@@ -3200,15 +3200,15 @@ class AnkiDirectReadStore:
                 "seconds": seconds,
                 "days": None,
             }
-    
+
         return {
             "raw": value,
             "unit": "days",
             "days": value,
             "seconds": None,
         }
-    
-    
+
+
     def _decode_revlog_factor(self, factor: int) -> dict[str, JSONValue]:
         # FSRS review log uses roughly 100..1100 as difficulty*100.
         if 100 <= factor <= 1100:
@@ -3218,7 +3218,7 @@ class AnkiDirectReadStore:
                 "difficulty": factor / 100.0,
                 "ease_multiplier": None,
             }
-    
+
         # SM-2 style ease factor permille (eg 2500 => 2.5).
         if factor > 0:
             return {
@@ -3227,15 +3227,15 @@ class AnkiDirectReadStore:
                 "difficulty": None,
                 "ease_multiplier": factor / 1000.0,
             }
-    
+
         return {
             "raw": factor,
             "model": "unknown",
             "difficulty": None,
             "ease_multiplier": None,
         }
-    
-    
+
+
     def _revlog_type_name(self, review_type: int) -> str:
         return {
             0: "learn",
@@ -3246,7 +3246,7 @@ class AnkiDirectReadStore:
         }.get(review_type, "unknown")
 
     def _seed_fsrs_card_from_revlog(
-        self, 
+        self,
         conn: sqlite3.Connection,
         scheduler: Scheduler,
         *,

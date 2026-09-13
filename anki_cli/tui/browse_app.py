@@ -249,7 +249,7 @@ def _extract_field_values(card: Mapping[str, Any]) -> list[str]:
 
         ordered.sort(key=lambda pair: pair[0])
         return [value for _, value in ordered] + unordered
-        
+
     return []
 
 
