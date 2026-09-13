@@ -138,7 +138,7 @@ def test_preview_ratings_returns_four_ease_options_with_decoded_due_info(
     monkeypatch.setattr(
         store,
         "_card_row_to_fsrs",
-        lambda row, *, col_crt_sec, now_dt: SimpleNamespace(
+        lambda row, *, timing, now_dt: SimpleNamespace(
             state=direct_mod.State.Review,
             step=None,
             stability=None,
@@ -189,11 +189,13 @@ def test_preview_ratings_returns_four_ease_options_with_decoded_due_info(
     assert out[2]["type"] == 2
     assert out[2]["queue"] == 2
     assert out[2]["interval"] == 12
+    today = store._today_due_index(int(direct_mod.time.time()))
     assert out[2]["due_info"] == {
         "kind": "review_day_index",
         "raw": 5,
         "day_index": 5,
         "epoch_secs": (10 + 5) * 86400,
+        "days_from_today": 5 - today,
     }
 
     assert out[3]["type"] == 2
@@ -204,6 +206,7 @@ def test_preview_ratings_returns_four_ease_options_with_decoded_due_info(
         "raw": 6,
         "day_index": 6,
         "epoch_secs": (10 + 6) * 86400,
+        "days_from_today": 6 - today,
     }
 
 
@@ -229,7 +232,7 @@ def test_preview_ratings_sets_relearning_step_zero_when_missing(
     monkeypatch.setattr(
         store,
         "_card_row_to_fsrs",
-        lambda row, *, col_crt_sec, now_dt: SimpleNamespace(
+        lambda row, *, timing, now_dt: SimpleNamespace(
             state=direct_mod.State.Relearning,
             step=None,
             stability=2.0,
@@ -281,7 +284,7 @@ def test_preview_ratings_falls_back_when_seed_unavailable(
     monkeypatch.setattr(
         store,
         "_card_row_to_fsrs",
-        lambda row, *, col_crt_sec, now_dt: SimpleNamespace(
+        lambda row, *, timing, now_dt: SimpleNamespace(
             state=direct_mod.State.Review,
             step=0,
             stability=None,
