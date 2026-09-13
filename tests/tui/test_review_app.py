@@ -363,3 +363,100 @@ def test_action_rate_reports_backend_failure() -> None:
 
     assert statuses[-1] == "answer failed: boom"
     assert calls["load_next"] == 0
+
+
+def test_refresh_rate_buttons_use_real_newlines() -> None:
+    app = review_mod.ReviewApp(backend=object(), deck=None)
+    seen: dict[str, Any] = {}
+    app._ui_update = lambda sel, val: seen.__setitem__(sel, val)  # type: ignore[method-assign]
+
+    app._refresh_rate_buttons()
+
+    for sel in ("#rate-1", "#rate-2", "#rate-3", "#rate-4"):
+        value = seen[sel]
+        assert "\\n" not in value
+        assert "\n" in value
+
+
+def test_hint_bar_lists_only_actual_bindings() -> None:
+    app = review_mod.ReviewApp(backend=object(), deck=None)
+    seen: dict[str, Any] = {}
+    app._ui_update = lambda sel, val: seen.__setitem__(sel, val)  # type: ignore[method-assign]
+
+    app._render_hint_bar()
+    text = seen["#hintbar"].plain
+
+    for binding in app.BINDINGS:
+        if binding.show:
+            assert binding.description in text
+            assert (binding.key_display or binding.key) in text
+        else:
+            assert binding.description not in text
+
+    # Phantom keys previously advertised must be gone.
+    for phantom in ("edit", "mark", "suspend"):
+        assert phantom not in text
+
+
+def test_shortcuts_block_omits_unbound_edit_key() -> None:
+    app = review_mod.ReviewApp(backend=object(), deck=None)
+    seen: dict[str, Any] = {}
+    app._ui_update = lambda sel, val: seen.__setitem__(sel, val)  # type: ignore[method-assign]
+
+    app._render_shortcuts()
+
+    assert "edit" not in seen["#shortcuts-block"].plain
+
+
+def test_action_rate_failed_answer_leaves_no_undo_entry(tmp_path) -> None:
+    class Store:
+        def snapshot_card_state(self, card_id: int) -> dict[str, Any]:
+            return {"id": card_id}
+
+    class Backend:
+        name = "direct"
+
+        def __init__(self) -> None:
+            self._store = Store()
+
+        def answer_card(self, *, card_id: int, ease: int) -> None:
+            raise RuntimeError("boom")
+
+    app = review_mod.ReviewApp(backend=Backend(), deck=None)
+    app._card_id = 5
+    app._show_answer = True
+    app._undo = review_mod.UndoStore(path=tmp_path / "undo.json")
+    app._set_status = lambda msg: None  # type: ignore[method-assign]
+
+    app.action_rate(3)
+
+    assert app._undo.pop(collection="") is None
+
+
+def test_action_rate_successful_answer_pushes_undo(tmp_path) -> None:
+    class Store:
+        def snapshot_card_state(self, card_id: int) -> dict[str, Any]:
+            return {"id": card_id, "queue": 2}
+
+    class Backend:
+        name = "direct"
+
+        def __init__(self) -> None:
+            self._store = Store()
+
+        def answer_card(self, *, card_id: int, ease: int) -> None:
+            return None
+
+    app = review_mod.ReviewApp(backend=Backend(), deck=None)
+    app._card_id = 5
+    app._show_answer = True
+    app._undo = review_mod.UndoStore(path=tmp_path / "undo.json")
+    app._set_status = lambda msg: None  # type: ignore[method-assign]
+    app._load_next = lambda: None  # type: ignore[method-assign]
+
+    app.action_rate(3)
+
+    item = app._undo.pop(collection="")
+    assert item is not None
+    assert item.card_id == 5
+    assert item.snapshot == {"id": 5, "queue": 2}

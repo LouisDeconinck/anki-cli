@@ -227,3 +227,69 @@ def test_format_due_short_handles_day_learn_like_review(monkeypatch: pytest.Monk
     assert browse_mod._format_due_short(day_learn) == "tomorrow"
     assert browse_mod._format_due_short(review) == "tomorrow"
     assert browse_mod._format_due_short(intraday) == "10m"
+
+
+class _CaptureStatic:
+    def __init__(self, selector: str, sink: dict[str, Any]) -> None:
+        self._selector = selector
+        self._sink = sink
+
+    def update(self, value: Any) -> None:
+        self._sink[self._selector] = value
+
+
+def _capture_updates(app: browse_mod.BrowseApp) -> dict[str, Any]:
+    sink: dict[str, Any] = {}
+    app.query_one = lambda sel, *a, **k: _CaptureStatic(sel, sink)  # type: ignore[method-assign]
+    return sink
+
+
+def test_hint_bar_lists_only_actual_bindings() -> None:
+    app = browse_mod.BrowseApp(backend=object())
+    captured = _capture_updates(app)
+
+    app._render_hint_bar()
+    text = captured["#hintbar"].plain
+
+    for binding in app.BINDINGS:
+        if binding.show:
+            assert binding.description in text
+            assert (binding.key_display or binding.key) in text
+
+    # Phantom keys previously advertised must be gone.
+    for phantom in ("add", "edit"):
+        assert phantom not in text
+
+
+def test_browse_has_no_edit_binding_or_stub_action() -> None:
+    actions = {b.action for b in browse_mod.BrowseApp.BINDINGS}
+    assert "edit_selected" not in actions
+    assert not hasattr(browse_mod.BrowseApp, "action_edit_selected")
+
+
+def test_preview_actions_label_enter_as_detail() -> None:
+    app = browse_mod.BrowseApp(backend=object())
+    captured = _capture_updates(app)
+
+    app._render_preview_empty()
+    actions = captured["#preview-actions"].plain
+
+    assert "Detail" in actions
+    assert "Study" not in actions
+    assert "Edit" not in actions
+
+
+def test_preview_actions_for_card_show_detail_and_unsuspend() -> None:
+    app = browse_mod.BrowseApp(backend=object())
+    app._visible_cards = [
+        {"cardId": 1, "queue": -1, "fields": ["Q", "A"], "tags": []},
+    ]
+    captured = _capture_updates(app)
+
+    app._update_preview_for_row(0)
+    actions = captured["#preview-actions"].plain
+
+    assert "Unsuspend" in actions
+    assert "Detail" in actions
+    assert "Study" not in actions
+    assert "Edit" not in actions

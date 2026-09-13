@@ -475,6 +475,7 @@ def _inline_review(ctx_obj: dict[str, Any], deck: str | None) -> None:
                     console.print(f"  [{DIM}](1/2/3/4/u/q)[/]")
                     continue
 
+                undo_item: UndoItem | None = None
                 if (
                     getattr(backend, "name", "") == "direct"
                     and hasattr(backend, "_store")
@@ -484,24 +485,29 @@ def _inline_review(ctx_obj: dict[str, Any], deck: str | None) -> None:
                     snap = cast(
                         Any, backend._store
                     ).snapshot_card_state(int(card_id))
-                    undo.push(UndoItem(
+                    undo_item = UndoItem(
                         collection=collection,
                         card_id=int(card_id),
                         snapshot=cast(dict[str, Any], snap),
                         created_at_epoch_ms=now_epoch_ms(),
-                    ))
+                    )
 
                 try:
                     backend.answer_card(
                         card_id=int(card_id), ease=ease
                     )
+                except Exception as exc:
+                    msg = str(exc) or type(exc).__name__
+                    console.print(f"  [{RED}]answer failed:[/] {msg}")
+                else:
+                    # Push only after a successful answer so a failed answer
+                    # cannot leave a stale undo entry.
+                    if undo_item is not None:
+                        undo.push(undo_item)
                     reviewed += 1
                     console.print(
                         f"  [{DIM}]rated {ease}  (reviewed={reviewed})[/]"
                     )
-                except Exception as exc:
-                    msg = str(exc) or type(exc).__name__
-                    console.print(f"  [{RED}]answer failed:[/] {msg}")
                 break
 
     finally:

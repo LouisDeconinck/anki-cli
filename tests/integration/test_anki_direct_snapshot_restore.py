@@ -92,11 +92,26 @@ def _revlog_rows(db_path: Path) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def _insert_revlog_row(db_path: Path, *, row_id: int, cid: int, ease: int = 3) -> None:
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        INSERT INTO revlog (id, cid, usn, ease, ivl, lastIvl, factor, time, type)
+        VALUES (?, ?, -1, ?, 10, 5, 2500, 0, 1)
+        """,
+        (row_id, cid, ease),
+    )
+    conn.commit()
+    conn.close()
+
+
 def test_snapshot_card_state_returns_expected_fields(tmp_path: Path) -> None:
     store, _db_path = _make_store_with_cards_revlog(tmp_path)
 
     snap = store.snapshot_card_state(100)
 
+    created_at = snap.pop("created_at_epoch_ms")
+    assert isinstance(created_at, int) and created_at > 0
     assert snap == {
         "id": 100,
         "did": 1,
@@ -121,15 +136,21 @@ def test_snapshot_card_state_missing_card_raises_lookup(tmp_path: Path) -> None:
         store.snapshot_card_state(999)
 
 
-def test_restore_card_state_updates_card_and_appends_revlog(
+def test_restore_card_state_updates_card_and_deletes_newer_revlog(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     store, db_path = _make_store_with_cards_revlog(tmp_path)
 
     monkeypatch.setattr(direct_mod.time, "time", lambda: 1234.567)
-    # Ensure deterministic revlog id
-    monkeypatch.setattr(store, "_allocate_epoch_ms_id", lambda conn, table: 5000)
+
+    # Older revlog row from before the snapshot; must be preserved.
+    _insert_revlog_row(db_path, row_id=1000, cid=100)
+    # Rows written by the review being undone (after the snapshot); deleted.
+    _insert_revlog_row(db_path, row_id=5000, cid=100)
+    _insert_revlog_row(db_path, row_id=6000, cid=100)
+    # Row for a different card; untouched even though it is newer.
+    _insert_revlog_row(db_path, row_id=7000, cid=200)
 
     snapshot = {
         "id": 100,
@@ -145,11 +166,12 @@ def test_restore_card_state_updates_card_and_appends_revlog(
         "left": 2002,
         "flags": 1,
         "data": '{"restored":true}',
+        "created_at_epoch_ms": 2000,
     }
 
     result = store.restore_card_state(snapshot)
 
-    assert result == {"card_id": 100, "restored": True, "revlog_id": 5000}
+    assert result == {"card_id": 100, "restored": True, "revlog_deleted": 2}
 
     row = _card_row(db_path, 100)
     assert row["did"] == 9
@@ -168,19 +190,38 @@ def test_restore_card_state_updates_card_and_appends_revlog(
     assert row["usn"] == -1
 
     revlog = _revlog_rows(db_path)
-    assert revlog == [
+    assert [r["id"] for r in revlog] == [1000, 7000]
+    assert all(r["type"] == 1 for r in revlog)
+
+
+def test_restore_card_state_without_snapshot_timestamp_leaves_revlog(
+    tmp_path: Path,
+) -> None:
+    store, db_path = _make_store_with_cards_revlog(tmp_path)
+
+    _insert_revlog_row(db_path, row_id=1000, cid=100)
+    _insert_revlog_row(db_path, row_id=5000, cid=100)
+
+    result = store.restore_card_state(
         {
-            "id": 5000,
-            "cid": 100,
-            "usn": -1,
-            "ease": 0,
-            "ivl": 0,
-            "lastIvl": 0,
-            "factor": 0,
-            "time": 0,
-            "type": 4,
+            "id": 100,
+            "did": 1,
+            "ord": 0,
+            "type": 2,
+            "queue": 2,
+            "due": 30,
+            "ivl": 15,
+            "factor": 2500,
+            "reps": 20,
+            "lapses": 1,
+            "left": 0,
+            "flags": 0,
+            "data": "",
         }
-    ]
+    )
+
+    assert result == {"card_id": 100, "restored": True, "revlog_deleted": 0}
+    assert [r["id"] for r in _revlog_rows(db_path)] == [1000, 5000]
 
 
 def test_restore_card_state_missing_id_type_raises_value_error(tmp_path: Path) -> None:
@@ -191,13 +232,9 @@ def test_restore_card_state_missing_id_type_raises_value_error(tmp_path: Path) -
 
 
 def test_restore_card_state_missing_target_card_returns_restored_false(
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     store, db_path = _make_store_with_cards_revlog(tmp_path)
-
-    monkeypatch.setattr(direct_mod.time, "time", lambda: 2000.0)
-    monkeypatch.setattr(store, "_allocate_epoch_ms_id", lambda conn, table: 7000)
 
     result = store.restore_card_state(
         {
@@ -214,21 +251,9 @@ def test_restore_card_state_missing_target_card_returns_restored_false(
             "left": 0,
             "flags": 0,
             "data": "",
+            "created_at_epoch_ms": 2000,
         }
     )
 
-    assert result == {"card_id": 999, "restored": False, "revlog_id": 7000}
-    revlog = _revlog_rows(db_path)
-    assert revlog == [
-        {
-            "id": 7000,
-            "cid": 999,
-            "usn": -1,
-            "ease": 0,
-            "ivl": 0,
-            "lastIvl": 0,
-            "factor": 0,
-            "time": 0,
-            "type": 4,
-        }
-    ]
+    assert result == {"card_id": 999, "restored": False, "revlog_deleted": 0}
+    assert _revlog_rows(db_path) == []

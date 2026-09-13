@@ -376,22 +376,27 @@ def review_answer_cmd(ctx: click.Context, card_id: int, rating: str) -> None:
 
     try:
         with backend_session_from_context(obj) as backend:
-            # Save undo snapshot (direct backend only)
+            # Save undo snapshot (direct backend only). The snapshot must
+            # capture pre-answer state, but it is pushed only after
+            # answer_card succeeds so a failed answer cannot leave a stale
+            # undo entry.
+            undo_item: UndoItem | None = None
             if getattr(backend, "name", "") == "direct" and hasattr(backend, "_store"):
                 col = getattr(backend, "collection_path", None)
                 collection = str(col) if col is not None else ""
                 direct_store = cast(Any, backend._store)
                 snap = direct_store.snapshot_card_state(int(card_id))
-                UndoStore().push(
-                    UndoItem(
-                        collection=collection,
-                        card_id=int(card_id),
-                        snapshot=cast(dict[str, Any], snap),
-                        created_at_epoch_ms=now_epoch_ms(),
-                    )
+                undo_item = UndoItem(
+                    collection=collection,
+                    card_id=int(card_id),
+                    snapshot=cast(dict[str, Any], snap),
+                    created_at_epoch_ms=now_epoch_ms(),
                 )
 
             result = backend.answer_card(card_id=int(card_id), ease=ease)
+
+            if undo_item is not None:
+                UndoStore().push(undo_item)
     except (BackendNotImplementedError, BackendFactoryError, NotImplementedError) as exc:
         _emit_backend_unavailable(ctx=ctx, command="review:answer", obj=obj, error=exc)
     except (AnkiConnectAPIError, AnkiConnectProtocolError, LookupError) as exc:

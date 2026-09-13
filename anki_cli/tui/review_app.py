@@ -357,10 +357,7 @@ class ReviewApp(App[None]):
     """
 
     BINDINGS: ClassVar[list[Binding]] = [
-        Binding("q", "quit", "Quit"),
-        Binding(":", "focus_command", "Command"),
-        Binding("escape", "blur_command", "Blur command"),
-        Binding("space", "toggle_answer", "Show/Hide answer"),
+        Binding("space", "toggle_answer", "Show/Hide answer", key_display="Space"),
         Binding("1", "rate(1)", "Again"),
         Binding("2", "rate(2)", "Hard"),
         Binding("3", "rate(3)", "Good"),
@@ -368,6 +365,9 @@ class ReviewApp(App[None]):
         Binding("u", "undo", "Undo"),
         Binding("p", "preview", "Preview"),
         Binding("n", "next", "Next"),
+        Binding(":", "focus_command", "Command"),
+        Binding("escape", "blur_command", "Blur command", show=False),
+        Binding("q", "quit", "Quit"),
     ]
 
     def __init__(self, *, backend: Any, deck: str | None) -> None:
@@ -455,19 +455,20 @@ class ReviewApp(App[None]):
             self._render_current()
             return
 
-        # Save undo snapshot (direct backend only).
+        # Save undo snapshot (direct backend only). The snapshot must capture
+        # pre-answer state, but it is pushed only after answer_card succeeds so
+        # a failed answer cannot leave a stale undo entry.
+        undo_item: UndoItem | None = None
         if getattr(self._backend, "name", "") == "direct" and hasattr(self._backend, "_store"):
             col = getattr(self._backend, "collection_path", None)
             collection = str(col) if col is not None else ""
             store = cast(Any, self._backend._store)
             snap = store.snapshot_card_state(int(self._card_id))
-            self._undo.push(
-                UndoItem(
-                    collection=collection,
-                    card_id=int(self._card_id),
-                    snapshot=cast(dict[str, Any], snap),
-                    created_at_epoch_ms=now_epoch_ms(),
-                )
+            undo_item = UndoItem(
+                collection=collection,
+                card_id=int(self._card_id),
+                snapshot=cast(dict[str, Any], snap),
+                created_at_epoch_ms=now_epoch_ms(),
             )
 
         try:
@@ -475,6 +476,9 @@ class ReviewApp(App[None]):
         except Exception as exc:
             self._set_status(f"answer failed: {exc}")
             return
+
+        if undo_item is not None:
+            self._undo.push(undo_item)
 
         self._answered += 1
         self._rating_counts[int(ease)] = self._rating_counts.get(int(ease), 0) + 1
@@ -610,30 +614,29 @@ class ReviewApp(App[None]):
 
     def _refresh_rate_buttons(self) -> None:
         hints = self._rating_hints()
-        self._ui_update("#rate-1", f"1 Again\\n{hints[1]}")
-        self._ui_update("#rate-2", f"2 Hard\\n{hints[2]}")
-        self._ui_update("#rate-3", f"3 Good\\n{hints[3]}")
-        self._ui_update("#rate-4", f"4 Easy\\n{hints[4]}")
+        self._ui_update("#rate-1", f"1 Again\n{hints[1]}")
+        self._ui_update("#rate-2", f"2 Hard\n{hints[2]}")
+        self._ui_update("#rate-3", f"3 Good\n{hints[3]}")
+        self._ui_update("#rate-4", f"4 Easy\n{hints[4]}")
 
     def _render_hint_bar(self) -> None:
+        # Derive the bar from BINDINGS so it can only advertise keys that
+        # actually do something.
         hint = Text()
-        shortcuts = [
-            ("Space", "show answer"), ("1-4", "rate card"), ("e", "edit"),
-            ("m", "mark"), ("s", "suspend"),
-        ]
-        for i, (key, label) in enumerate(shortcuts):
-            if i > 0:
+        first = True
+        for binding in self.BINDINGS:
+            if not binding.show:
+                continue
+            if not first:
                 hint.append("   ")
-            hint.append(f" {key} ", style=f"bold {BLUE}")
-            hint.append(f" {label}", style=DIM)
-        hint.append("   ")
-        hint.append(" q ", style=f"bold {BLUE}")
-        hint.append(" quit session", style=DIM)
+            hint.append(f" {binding.key_display or binding.key} ", style=f"bold {BLUE}")
+            hint.append(f" {binding.description}", style=DIM)
+            first = False
         self._ui_update("#hintbar", hint)
 
     def _render_shortcuts(self) -> None:
         sc = Text()
-        for key, label in [("Space", "flip"), ("e", "edit"), ("q", "quit")]:
+        for key, label in [("Space", "flip"), ("q", "quit")]:
             sc.append(f" {key} ", style=f"bold {BLUE}")
             sc.append(f"  {label}\n", style=DIM)
         self._ui_update("#shortcuts-block", sc)

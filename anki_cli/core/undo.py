@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import json
+import os
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,7 +88,28 @@ class UndoStore:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         data.setdefault("version", 1)
         data.setdefault("items", [])
-        self._path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        payload = json.dumps(data, ensure_ascii=False, indent=2)
+
+        # Write to a temp file in the same directory, then atomically rename so
+        # a crash mid-write cannot leave a truncated undo.json.
+        tmp_name = ""
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self._path.parent,
+                prefix=f".{self._path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as tmp:
+                tmp.write(payload)
+                tmp_name = tmp.name
+            os.replace(tmp_name, self._path)
+        finally:
+            if tmp_name:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_name)
 
 
 def now_epoch_ms() -> int:

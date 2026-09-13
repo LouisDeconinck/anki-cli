@@ -1102,6 +1102,7 @@ class AnkiDirectReadStore:
             "left": int(row["left"]),
             "flags": int(row["flags"]),
             "data": str(row["data"] or ""),
+            "created_at_epoch_ms": int(time.time() * 1000),
         }
 
 
@@ -1150,17 +1151,23 @@ class AnkiDirectReadStore:
                 ),
             ).rowcount
 
-            # Manual revlog entry; we never delete revlog.
-            revlog_id = self._allocate_epoch_ms_id(conn, "revlog")
-            conn.execute(
-                """
-                INSERT INTO revlog (id, cid, usn, ease, ivl, lastIvl, factor, time, type)
-                VALUES (?, ?, -1, 0, 0, 0, 0, 0, 4)
-                """,
-                (revlog_id, card_id),
-            )
+            # Match Anki's undo semantics: drop the revlog rows written by the
+            # review being undone (anything logged after the snapshot was taken)
+            # instead of appending a compensating row. Without this, legacy
+            # cards seeded from revlog compute a different stability afterwards.
+            created_at_epoch_ms = snapshot.get("created_at_epoch_ms")
+            revlog_deleted = 0
+            if isinstance(created_at_epoch_ms, int):
+                revlog_deleted = conn.execute(
+                    "DELETE FROM revlog WHERE cid = ? AND id > ?",
+                    (card_id, int(created_at_epoch_ms)),
+                ).rowcount
 
-        return {"card_id": card_id, "restored": int(updated) > 0, "revlog_id": revlog_id}
+        return {
+            "card_id": card_id,
+            "restored": int(updated) > 0,
+            "revlog_deleted": int(revlog_deleted),
+        }
 
 
     def preview_ratings(self, card_id: int) -> list[dict[str, JSONValue]]:
