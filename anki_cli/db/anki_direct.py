@@ -2951,24 +2951,34 @@ class AnkiDirectReadStore:
             if deck_retention is not None
             else float(cfg.desired_retention or 0.9)
         )
-        learning_steps = self._to_timedeltas(
-            cfg.learn_steps,
-            default=[1.0, 10.0],
-            assume_minutes=True,
-        )
-        relearning_steps = self._to_timedeltas(
-            cfg.relearn_steps, default=[10.0], assume_minutes=True
-        )
         max_interval = int(cfg.maximum_review_interval or 36500)
 
-        scheduler = Scheduler(
-            parameters=params,
-            desired_retention=desired_retention,
-            learning_steps=learning_steps,
-            relearning_steps=relearning_steps,
-            maximum_interval=max_interval,
+        # Repeated proto fields cannot express "unset", so a deck_config row
+        # always supplies the step lists -- including empty ones, which mean
+        # "no (re)learning steps" exactly like blanked steps in Anki. Only when
+        # the row itself is missing do py-fsrs's built-in defaults apply.
+        if cfg_row is not None:
+            scheduler = Scheduler(
+                parameters=params,
+                desired_retention=desired_retention,
+                learning_steps=self._to_timedeltas(cfg.learn_steps, assume_minutes=True),
+                relearning_steps=self._to_timedeltas(
+                    cfg.relearn_steps, assume_minutes=True
+                ),
+                maximum_interval=max_interval,
+            )
+        else:
+            scheduler = Scheduler(
+                parameters=params,
+                desired_retention=desired_retention,
+                maximum_interval=max_interval,
+            )
+        return (
+            scheduler,
+            desired_retention,
+            len(scheduler.learning_steps),
+            len(scheduler.relearning_steps),
         )
-        return scheduler, desired_retention, len(learning_steps), len(relearning_steps)
 
     def _pick_fsrs_parameters(self, cfg: DeckConfigConfig) -> list[float]:
         for candidate in (cfg.fsrs_params_6, cfg.fsrs_params_5, cfg.fsrs_params_4):
@@ -3003,18 +3013,21 @@ class AnkiDirectReadStore:
         self,
         values: list[float],
         *,
-        default: list[float],
         assume_minutes: bool,
     ) -> list[timedelta]:
-        source = values or default
+        """Convert configured step values to timedeltas, keeping empty empty.
+
+        No implicit default: an empty step list is a real configuration (Anki
+        lets users blank the steps), not a missing one.
+        """
         out: list[timedelta] = []
-        for value in source:
+        for value in values:
             raw = float(value)
             if raw <= 0:
                 continue
             seconds = raw * 60.0 if assume_minutes else raw
             out.append(timedelta(seconds=max(1, round(seconds))))
-        return out if out else [timedelta(seconds=60)]
+        return out
 
     def _card_row_to_fsrs(
         self,
