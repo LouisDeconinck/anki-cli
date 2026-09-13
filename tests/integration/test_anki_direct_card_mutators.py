@@ -216,8 +216,10 @@ def test_bury_then_unbury_all_restores_queue_by_type(
 
     _insert_card(db_path, card_id=1, card_type=0, queue=0)    # new
     _insert_card(db_path, card_id=2, card_type=2, queue=2)    # review
-    _insert_card(db_path, card_id=3, card_type=3, queue=-2)   # buried relearn
-    _insert_card(db_path, card_id=4, card_type=1, queue=-3)   # buried learn/sib
+    # Buried relearn with a day-index due -> day-learn queue (3) on unbury.
+    _insert_card(db_path, card_id=3, card_type=3, queue=-2, due=20_050)
+    # Buried learn with an epoch due -> intraday learn queue (1) on unbury.
+    _insert_card(db_path, card_id=4, card_type=1, queue=-3, due=1_700_000_300)
 
     buried = store.bury_cards(card_ids=[2, 1, 2, 999])
     assert buried == {"buried": 2, "card_ids": [1, 2, 999]}
@@ -231,6 +233,20 @@ def test_bury_then_unbury_all_restores_queue_by_type(
     assert _card_row(db_path, 2)["queue"] == 2
     assert _card_row(db_path, 3)["queue"] == 3
     assert _card_row(db_path, 4)["queue"] == 1
+
+
+def test_unbury_in_filtered_deck_reads_odue_for_the_learn_unit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store, db_path = _make_store(tmp_path)
+    monkeypatch.setattr(store, "_ensure_write_safe", lambda: None)
+    # Buried learn card parked in a filtered deck: due=position, odue=epoch.
+    _insert_card(db_path, card_id=5, card_type=1, queue=-2, due=2, odue=1_700_000_300)
+
+    store.unbury_cards()
+
+    assert _card_row(db_path, 5)["queue"] == 1
 
 
 def test_unbury_deck_scope_includes_children(

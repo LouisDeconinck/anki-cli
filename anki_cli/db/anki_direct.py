@@ -31,6 +31,40 @@ from anki_cli.proto.anki.notetypes import (
     NotetypeTemplateConfig,
 )
 
+# Anki stores two different units in cards.due for learning cards: intraday
+# learning (queue 1) holds a unix epoch in seconds, day-learn (queue 3) holds a
+# day index relative to col.crt. rslib tells them apart with this threshold
+# (Card::restore_queue_from_type); any epoch after 2001-09-09 exceeds it and
+# no plausible day index ever will.
+LEARN_DUE_EPOCH_THRESHOLD = 1_000_000_000
+
+
+def is_intraday_learn_due(due: int) -> bool:
+    return due > LEARN_DUE_EPOCH_THRESHOLD
+
+
+# A card parked in a filtered deck keeps its real due in ``odue`` while ``due``
+# holds a position; rslib's restore_queue_after_bury_or_suspend reads
+# ``original_due`` when it is set. Use this wherever the *scheduling* due of a
+# card is needed regardless of where it currently lives.
+RESTORED_DUE_SQL = "CASE WHEN odue > 0 THEN odue ELSE due END"
+
+
+def queue_from_type_sql(*, due_expr: str = RESTORED_DUE_SQL) -> str:
+    """SQL CASE recomputing ``queue`` from ``type`` (rslib ``restore_queue_from_type``).
+
+    Used when a card leaves the suspended/buried/filtered state. ``due_expr`` is
+    the expression holding the card's scheduling due *after* the surrounding
+    UPDATE, which matters because SQLite evaluates SET clauses against the
+    pre-update row. The default reads ``odue`` for cards in a filtered deck.
+    """
+    return f"""CASE
+                        WHEN type = 0 THEN 0
+                        WHEN type IN (1, 3) THEN
+                            CASE WHEN ({due_expr}) > {LEARN_DUE_EPOCH_THRESHOLD} THEN 1 ELSE 3 END
+                        ELSE 2
+                    END"""
+
 
 class AnkiDirectReadStore:
     """Helpers for Anki's collection(.anki21b/.anki2) schema."""
@@ -961,10 +995,14 @@ class AnkiDirectReadStore:
                     params,
                 ).fetchone()[0]
             )
+            # queue 1 stores an epoch, queue 3 (day-learn) a day index.
             learn_count = int(
                 conn.execute(
-                    f"SELECT COUNT(*) FROM cards WHERE queue IN (1, 3) AND due <= ? {did_filter}",
-                    (now_sec, *params),
+                    f"""
+                    SELECT COUNT(*) FROM cards
+                    WHERE ((queue = 1 AND due <= ?) OR (queue = 3 AND due <= ?)) {did_filter}
+                    """,
+                    (now_sec, today_days, *params),
                 ).fetchone()[0]
             )
             review_count = int(
@@ -988,16 +1026,18 @@ class AnkiDirectReadStore:
         with self._connect() as conn:
             did_filter, params = self._deck_filter(conn, deck)
 
-            # 1) learning/relearning due (epoch seconds)
+            # 1) learning/relearning due. Intraday (queue 1) holds an epoch,
+            #    day-learn (queue 3) a day index; order both by absolute time.
+            crt_day = self._col_crt_day(conn)
             row = conn.execute(
                 f"""
                 SELECT id, due
                 FROM cards
-                WHERE queue IN (1, 3) AND due <= ? {did_filter}
-                ORDER BY due ASC, id ASC
+                WHERE ((queue = 1 AND due <= ?) OR (queue = 3 AND due <= ?)) {did_filter}
+                ORDER BY CASE WHEN queue = 1 THEN due ELSE (? + due) * 86400 END ASC, id ASC
                 LIMIT 1
                 """,
-                (now_sec, *params),
+                (now_sec, today_days, *params, crt_day),
             ).fetchone()
             if row is not None:
                 return {"card_id": int(row["id"]), "kind": "learn_due"}
@@ -1212,6 +1252,7 @@ class AnkiDirectReadStore:
                     col_crt_sec=col_crt_sec,
                     learn_step_count=learn_count,
                     relearn_step_count=relearn_count,
+                    now_dt=review_dt,
                 )
 
                 out.append(
@@ -1279,14 +1320,9 @@ class AnkiDirectReadStore:
             now_sec = int(time.time())
             if deck is None:
                 updated = conn.execute(
-                    """
+                    f"""
                     UPDATE cards
-                    SET queue = CASE
-                        WHEN type = 0 THEN 0
-                        WHEN type = 2 THEN 2
-                        WHEN type = 3 THEN 3
-                        ELSE 1
-                    END,
+                    SET queue = {queue_from_type_sql()},
                     mod = ?, usn = -1
                     WHERE queue IN (-2, -3)
                     """,
@@ -1306,12 +1342,7 @@ class AnkiDirectReadStore:
             updated = conn.execute(
                 f"""
                 UPDATE cards
-                SET queue = CASE
-                    WHEN type = 0 THEN 0
-                    WHEN type = 2 THEN 2
-                    WHEN type = 3 THEN 3
-                    ELSE 1
-                END,
+                SET queue = {queue_from_type_sql()},
                 mod = ?, usn = -1
                 WHERE queue IN (-2, -3) AND did IN ({placeholders})
                 """,
@@ -1695,7 +1726,7 @@ class AnkiDirectReadStore:
         placeholders = ", ".join(["?"] * len(filtered_deck_ids))
         # SQLite evaluates SET expressions against the pre-update row, so the
         # restored due value has to be spelled out again inside the queue CASE.
-        restored_due = "CASE WHEN odue > 0 THEN odue ELSE due END"
+        restored_due = RESTORED_DUE_SQL
         cursor = conn.execute(
             f"""
             UPDATE cards
@@ -1705,10 +1736,7 @@ class AnkiDirectReadStore:
                 odue = 0,
                 queue = CASE
                     WHEN queue < 0 THEN queue
-                    WHEN type = 0 THEN 0
-                    WHEN type IN (1, 3) THEN
-                        CASE WHEN ({restored_due}) > 1000000000 THEN 1 ELSE 3 END
-                    ELSE 2
+                    ELSE {queue_from_type_sql(due_expr=restored_due)}
                 END,
                 mod = ?,
                 usn = -1
@@ -2274,9 +2302,11 @@ class AnkiDirectReadStore:
                 col_crt_sec=col_crt_sec,
                 learn_step_count=learn_count,
                 relearn_step_count=relearn_count,
+                now_dt=review_dt,
             )
 
             now_sec = int(review_dt.timestamp())
+            today_days = max(0, int(now_sec // 86400) - int(col_crt_sec // 86400))
             reps = int(row["reps"]) + 1
             lapses = int(row["lapses"]) + (1 if ease == 1 else 0)
             raw_data = self._parse_card_data(str(row["data"] or ""))
@@ -2327,9 +2357,18 @@ class AnkiDirectReadStore:
             old_queue = int(row["queue"])
             old_ivl = int(row["ivl"])
 
-            logged_ivl = new_ivl if new_queue == 2 else -max(1, int(next_due_epoch - now_sec))
-            if old_queue in (1, 3):
+            # rslib as_revlog_interval: review/day-learn intervals are logged
+            # in positive days, intraday learning in negative seconds.
+            if new_queue == 2:
+                logged_ivl = new_ivl
+            elif new_queue == 3:
+                logged_ivl = max(1, int(new_due - today_days))
+            else:
+                logged_ivl = -max(1, int(next_due_epoch - now_sec))
+            if old_queue == 1:
                 logged_last_ivl = -max(1, int(old_due - now_sec))
+            elif old_queue == 3:
+                logged_last_ivl = max(1, int(old_due - today_days))
             elif old_queue == 2:
                 logged_last_ivl = max(1, old_ivl)
             else:
@@ -2395,6 +2434,11 @@ class AnkiDirectReadStore:
 
     # ---- low-level helpers ------------------------------------------------
 
+    def _col_crt_day(self, conn: sqlite3.Connection) -> int:
+        row = conn.execute("SELECT crt FROM col LIMIT 1").fetchone()
+        crt = int(row["crt"]) if row is not None else int(time.time())
+        return int(crt // 86400)
+
     def _today_due_index(self, now_sec: int) -> int:
         with self._connect() as conn:
             row = conn.execute("SELECT crt FROM col LIMIT 1").fetchone()
@@ -2440,26 +2484,26 @@ class AnkiDirectReadStore:
             if deck_row is None:
                 return None
             did = int(deck_row["id"])
-            col_row = conn.execute("SELECT crt FROM col LIMIT 1").fetchone()
-            col_crt = int(col_row["crt"]) if col_row is not None else int(time.time())
+            crt_day = self._col_crt_day(conn)
+            # Only queue 1 stores an epoch; queues 2 and 3 store a day index.
             row = conn.execute(
                 """
                 SELECT queue, due
                 FROM cards
                 WHERE did = ? AND queue IN (1, 2, 3)
-                ORDER BY CASE WHEN queue IN (1, 3) THEN due ELSE due * 86400 END, id
+                ORDER BY CASE WHEN queue = 1 THEN due ELSE (? + due) * 86400 END, id
                 LIMIT 1
                 """,
-                (did,),
+                (did, crt_day),
             ).fetchone()
             if row is None:
                 return None
 
         queue = int(row["queue"])
         due = int(row["due"])
-        if queue in (1, 3):
+        if queue == 1:
             return {"queue": queue, "epoch_secs": due}
-        due_epoch = (int(col_crt // 86400) + due) * 86400
+        due_epoch = (crt_day + due) * 86400
         return {"queue": queue, "day_index": due, "epoch_secs": int(due_epoch)}
 
     def _coerce_int_value(self, value: JSONValue) -> int | None:
@@ -2686,12 +2730,7 @@ class AnkiDirectReadStore:
                 f"""
                 UPDATE cards
                 SET
-                    queue = CASE
-                        WHEN type = 0 THEN 0
-                        WHEN type = 2 THEN 2
-                        WHEN type = 3 THEN 3
-                        ELSE 1
-                    END,
+                    queue = {queue_from_type_sql()},
                     mod = ?,
                     usn = -1
                 WHERE id IN ({existing_placeholders})
@@ -2837,8 +2876,14 @@ class AnkiDirectReadStore:
             due_dt = datetime.fromtimestamp((crt_day + due_raw) * 86400, tz=UTC)
             state = State.Review
         elif queue in (1, 3) or card_type in (1, 3):
-            due_dt = datetime.fromtimestamp(due_raw, tz=UTC)
-            state = State.Relearning if card_type == 3 or queue == 3 else State.Learning
+            if is_intraday_learn_due(due_raw):
+                due_dt = datetime.fromtimestamp(due_raw, tz=UTC)
+            else:
+                # Day-learn: due is a day index relative to col.crt.
+                crt_day = int(col_crt_sec // 86400)
+                due_dt = datetime.fromtimestamp((crt_day + due_raw) * 86400, tz=UTC)
+            # Relearning is a property of type (3), not of the day-learn queue.
+            state = State.Relearning if card_type == 3 else State.Learning
         else:
             due_dt = now_dt
             state = State.Learning
@@ -2864,23 +2909,40 @@ class AnkiDirectReadStore:
         col_crt_sec: int,
         learn_step_count: int,
         relearn_step_count: int,
+        now_dt: datetime,
     ) -> tuple[int, int, int, int, int, int]:
-        now_dt = datetime.now(UTC)
+        """Translate an FSRS result into Anki's ``(type, queue, due, ivl, left, due_epoch)``.
+
+        ``now_dt`` must be the same instant handed to the FSRS scheduler as
+        ``review_datetime`` so interval arithmetic is exact.
+        """
         next_due_dt = next_card.due if next_card.due is not None else now_dt
         next_due_epoch = int(next_due_dt.timestamp())
+        now_epoch = int(now_dt.timestamp())
+        crt_day = int(col_crt_sec // 86400)
+        today_days = max(0, int(now_epoch // 86400) - crt_day)
 
         if next_card.state == State.Review:
-            crt_day = int(col_crt_sec // 86400)
             due_days = max(0, int(next_due_epoch // 86400) - crt_day)
             ivl_days = max(1, round((next_due_dt - now_dt).total_seconds() / 86400.0))
             return (2, 2, due_days, ivl_days, 0, next_due_epoch)
+
+        # Anki keeps learning steps shorter than a day in the intraday queue
+        # (epoch due) and moves longer steps to the day-learn queue, whose due
+        # is today + round(step / 1 day) (rslib LearnState -> InDays).
+        def learn_queue_and_due() -> tuple[int, int]:
+            delta = next_due_epoch - now_epoch
+            if delta >= 86400:
+                return (3, today_days + max(1, round(delta / 86400.0)))
+            return (1, next_due_epoch)
 
         if next_card.state == State.Relearning:
             total = max(1, relearn_step_count)
             step = int(next_card.step or 0)
             remaining = max(1, total - step)
             left = (remaining * 1000) + remaining
-            return (3, 1, next_due_epoch, 0, left, next_due_epoch)
+            queue, due = learn_queue_and_due()
+            return (3, queue, due, 0, left, next_due_epoch)
 
         # Learning (new or ongoing)
         old_type = int(current_row["type"])
@@ -2889,7 +2951,8 @@ class AnkiDirectReadStore:
         step = int(next_card.step or 0)
         remaining = max(1, total - step)
         left = (remaining * 1000) + remaining
-        return (new_type, 1, next_due_epoch, 0, left, next_due_epoch)
+        queue, due = learn_queue_and_due()
+        return (new_type, queue, due, 0, left, next_due_epoch)
 
     def _decode_message(self, message: Any, blob: bytes, *, context: str) -> Any:
         try:
@@ -3053,7 +3116,17 @@ class AnkiDirectReadStore:
             return {"kind": "new_position", "raw": due_raw, "position": due_raw}
 
         if card_type in (1, 3):
-            return {"kind": "learn_epoch_secs", "raw": due_raw, "epoch_secs": due_raw}
+            if is_intraday_learn_due(due_raw):
+                return {"kind": "learn_epoch_secs", "raw": due_raw, "epoch_secs": due_raw}
+            # Day-learn (queue 3): a learning step of >= 1 day stores a day index.
+            out_learn: dict[str, JSONValue] = {
+                "kind": "learn_day_index",
+                "raw": due_raw,
+                "day_index": due_raw,
+            }
+            if col_crt_sec is not None:
+                out_learn["epoch_secs"] = int((int(col_crt_sec // 86400) + due_raw) * 86400)
+            return out_learn
 
         if card_type == 2:
             out: dict[str, JSONValue] = {
