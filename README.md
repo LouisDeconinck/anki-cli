@@ -251,6 +251,7 @@ For other AI coding agents, point them at `SKILL.md` in the repo root or include
 - Use `--yes` for destructive operations (`note:delete`, `deck:delete`, `notetype:field:remove`).
 - In direct mode, avoid write operations while Anki Desktop is open.
 - If Anki Desktop is running, prefer `--backend ankiconnect`.
+- In direct mode, `csum` for notes with HTML in the first field now matches Anki. Rows written by older anki-cli versions keep their old csum until Tools ▸ Check Database recomputes them; duplicate detection may miss them until then.
 
 ## Development
 
