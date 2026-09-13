@@ -163,11 +163,42 @@ def test_collection_override_from_file_only_when_key_explicit(
 
 def test_resolve_runtime_config_maps_legacy_standalone_to_auto(
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A stale prefer='standalone' (file or env) warns and falls back to auto
+    """A stale ANKI_CLI_BACKEND=standalone warns and falls back to auto
     instead of locking out every command — including config:set itself."""
-    loaded = _loaded_config(prefer="standalone")
+    loaded = _loaded_config()
+    monkeypatch.setattr(config_runtime, "load_app_config", lambda config_path=None: loaded)
+
+    runtime = resolve_runtime_config(
+        cli_backend="auto",
+        cli_backend_set=False,
+        cli_output_format="table",
+        cli_output_set=False,
+        cli_no_color=False,
+        cli_no_color_set=False,
+        cli_collection_path=None,
+        cli_collection_set=False,
+        env={"ANKI_CLI_BACKEND": "standalone"},
+    )
+
+    assert runtime.backend == "auto"
+    assert any(
+        "standalone" in w and "ANKI_CLI_BACKEND" in w for w in runtime.warnings
+    )
+
+
+def test_resolve_runtime_config_propagates_load_warnings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Warnings collected at load (e.g. the stale-path shim) ride along on
+    RuntimeConfig so the CLI can put them in meta.warnings."""
+    loaded = _loaded_config()
+    loaded = LoadedConfig(
+        app=loaded.app,
+        config_path=loaded.config_path,
+        file_data=loaded.file_data,
+        warnings=["stale collection.path ignored"],
+    )
     monkeypatch.setattr(config_runtime, "load_app_config", lambda config_path=None: loaded)
 
     runtime = resolve_runtime_config(
@@ -182,8 +213,105 @@ def test_resolve_runtime_config_maps_legacy_standalone_to_auto(
         env={},
     )
 
-    assert runtime.backend == "auto"
-    assert "standalone" in capsys.readouterr().err
+    assert "stale collection.path ignored" in runtime.warnings
+
+
+def test_load_app_config_maps_legacy_standalone_prefer(
+    tmp_path: Path,
+) -> None:
+    """A file-level prefer="standalone" left by main normalizes to auto at
+    load (before Literal validation) and says how to silence it."""
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('[backend]\nprefer = "standalone"\n', encoding="utf-8")
+
+    loaded = load_app_config(config_path=config_path)
+
+    assert loaded.app.backend.prefer == "auto"
+    assert any(
+        "standalone" in w and "config:set" in w for w in loaded.warnings
+    )
+
+
+def test_load_app_config_drops_legacy_standalone_collection_defaults(
+    tmp_path: Path,
+) -> None:
+    """The stale `path`/`anki_profile` defaults main persisted are treated as
+    absent — the exact file shape that locked existing users out."""
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        '[collection]\n'
+        'path = "~/.local/share/anki-cli/collection.db"\n'
+        'anki_profile = "User 1"\n',
+        encoding="utf-8",
+    )
+
+    loaded = load_app_config(config_path=config_path)
+
+    assert loaded.app.collection.path is None
+    assert loaded.app.collection.anki_profile is None
+    assert "path" not in loaded.file_data["collection"]
+    assert "anki_profile" not in loaded.file_data["collection"]
+    assert any("stale collection.path" in w for w in loaded.warnings)
+
+    # ...and the dropped path no longer acts as a --col override.
+    override = config_runtime._resolve_collection_override(
+        cli_collection_path=None,
+        cli_collection_set=False,
+        env_collection=None,
+        file_collection=loaded.app.collection.path,
+        file_data=loaded.file_data,
+    )
+    assert override is None
+
+
+def test_load_app_config_keeps_profile_when_no_stale_path_marker(
+    tmp_path: Path,
+) -> None:
+    """anki_profile="User 1" without the stale path could be deliberate —
+    only a main-written file (stale path marker) has it dropped."""
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        '[collection]\nanki_profile = "User 1"\n', encoding="utf-8"
+    )
+
+    loaded = load_app_config(config_path=config_path)
+
+    assert loaded.app.collection.anki_profile == "User 1"
+
+
+def test_load_app_config_keeps_custom_profile_with_stale_path(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        '[collection]\n'
+        'path = "~/.local/share/anki-cli/collection.db"\n'
+        'anki_profile = "Work"\n',
+        encoding="utf-8",
+    )
+
+    loaded = load_app_config(config_path=config_path)
+
+    assert loaded.app.collection.path is None
+    assert loaded.app.collection.anki_profile == "Work"
+
+
+def test_set_config_value_drops_legacy_dead_default_path(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        '[collection]\npath = "~/.local/share/anki-cli/collection.db"\n',
+        encoding="utf-8",
+    )
+
+    set_config_value(
+        key="collection.anki_profile",
+        raw_value="Work",
+        config_path=config_path,
+    )
+
+    text = config_path.read_text(encoding="utf-8")
+    assert "collection.db" not in text
+    assert 'anki_profile = "Work"' in text
 
 
 def test_resolve_runtime_config_invalid_env_backend(
@@ -294,8 +422,8 @@ def test_set_anki_profile_does_not_persist_collection_path(
     monkeypatch.setattr(detect_mod, "_anki_data_roots", lambda: [root])
 
     assert (
-        detect_mod._resolve_direct_collection(
-            None, anki_profile=reloaded.app.collection.anki_profile
+        detect_mod._require_direct_collection(
+            None, reloaded.app.collection.anki_profile
         )
         == db
     )
@@ -311,13 +439,78 @@ def test_set_config_value_unknown_key_raises(tmp_path: Path) -> None:
 
 
 def test_set_config_value_rejects_section_key(tmp_path: Path) -> None:
-    # A key naming a whole section resolves to a non-scalar value.
-    with pytest.raises(ConfigError, match="Unsupported value type"):
+    # A key naming a whole section fails validation — a scalar can't be
+    # assigned to a nested model.
+    with pytest.raises(ConfigError, match="Invalid value for 'display'"):
         set_config_value(
             key="display",
             raw_value="[1]",
             config_path=tmp_path / "config.toml",
         )
+
+
+def test_set_config_value_rejects_invalid_enum_value(tmp_path: Path) -> None:
+    # Literal-typed fields reject bad writes at set time instead of failing
+    # every subsequent run.
+    with pytest.raises(ConfigError, match="Invalid value"):
+        set_config_value(
+            key="backend.prefer",
+            raw_value="direkt",
+            config_path=tmp_path / "config.toml",
+        )
+
+    with pytest.raises(ConfigError, match="Invalid value"):
+        set_config_value(
+            key="display.default_output",
+            raw_value="xml",
+            config_path=tmp_path / "config.toml",
+        )
+
+
+def test_set_config_value_empty_string_clears_optional_field(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    set_config_value(
+        key="collection.anki_profile", raw_value="Work", config_path=config_path
+    )
+    assert 'anki_profile = "Work"' in config_path.read_text(encoding="utf-8")
+
+    _loaded, old_value, new_value = set_config_value(
+        key="collection.anki_profile", raw_value="", config_path=config_path
+    )
+
+    assert old_value == "Work"
+    assert new_value is None
+    assert "anki_profile" not in config_path.read_text(encoding="utf-8")
+
+
+def test_collection_path_empty_string_is_unset() -> None:
+    override = config_runtime._resolve_collection_override(
+        cli_collection_path=None,
+        cli_collection_set=False,
+        env_collection=None,
+        file_collection="",
+        file_data={"collection": {"path": ""}},
+    )
+    assert override is None
+
+
+def test_set_config_value_escapes_control_chars(tmp_path: Path) -> None:
+    """A value with control chars must serialize as an escaped basic string —
+    never an unparseable file that locks out every later command."""
+    config_path = tmp_path / "config.toml"
+
+    set_config_value(
+        key="collection.anki_profile",
+        raw_value="Work\nHome\x01",
+        config_path=config_path,
+    )
+
+    text = config_path.read_text(encoding="utf-8")
+    assert "\\n" in text       # named escape for the newline
+    assert "\\u0001" in text   # non-named C0 chars become \uXXXX
+
+    loaded = load_app_config(config_path=config_path)
+    assert loaded.app.collection.anki_profile == "Work\nHome\x01"
 
 
 def test_set_config_value_rejects_unknown_section(tmp_path: Path) -> None:

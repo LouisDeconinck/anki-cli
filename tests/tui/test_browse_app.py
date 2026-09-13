@@ -6,6 +6,7 @@ import pytest
 
 pytest.importorskip("textual")
 
+import anki_cli.tui._utils as utils_mod
 import anki_cli.tui.browse_app as browse_mod
 
 pytestmark = pytest.mark.tui
@@ -155,7 +156,7 @@ def test_format_card_detail_renders_mapping_fields() -> None:
 def test_format_due_short_handles_day_learn_like_review(monkeypatch: pytest.MonkeyPatch) -> None:
     """Day-learn cards (#19) carry a day index + epoch, not an intraday epoch."""
     now = 1_700_000_000
-    monkeypatch.setattr(browse_mod.time, "time", lambda: now)
+    monkeypatch.setattr(utils_mod.time, "time", lambda: now)
 
     def card(kind: str, queue: int, **due_info: int) -> dict:
         return {"queue": queue, "due_info": {"kind": kind, "day_index": 5, **due_info}}
@@ -247,7 +248,7 @@ def test_format_due_short_epoch_fallback_rounds_up_to_the_due_day(
     """#21: epoch_secs is the *start* of the due scheduling day. A rollover 21 h
     away is tomorrow, and flooring (epoch - now) // 86400 wrongly said today."""
     now = 1_700_000_000
-    monkeypatch.setattr(browse_mod.time, "time", lambda: now)
+    monkeypatch.setattr(utils_mod.time, "time", lambda: now)
 
     def review(epoch: int) -> dict:
         return {

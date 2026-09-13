@@ -4,7 +4,6 @@ import contextlib
 import html as _html
 import re
 import shlex
-import time
 from collections.abc import Mapping
 from typing import Any, ClassVar, cast
 
@@ -20,7 +19,7 @@ from anki_cli import __version__
 from anki_cli.core.scheduler import pick_next_due_card_id
 from anki_cli.core.template import render_template
 from anki_cli.core.undo import UndoItem, UndoStore, now_epoch_ms
-from anki_cli.tui._utils import relative_eta
+from anki_cli.tui._utils import due_day_label, relative_eta, to_int
 from anki_cli.tui.colors import (
     BLUE,
     BORDER,
@@ -79,26 +78,6 @@ def _pick_template(templates: Mapping[str, Any], ord_: int) -> Mapping[str, Any]
 
     return None
 
-def _safe_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _days_from_today(due_info: Mapping[str, Any]) -> int | None:
-    """Days until a day-index due. Prefers the backend's relative count; the
-    fallback treats epoch_secs as the *start* of the due day, so it rounds up
-    rather than flooring (a rollover 21 h away is tomorrow, not today)."""
-    rel = due_info.get("days_from_today")
-    if isinstance(rel, int):
-        return rel
-    epoch = due_info.get("epoch_secs")
-    if isinstance(epoch, int):
-        return max(0, -((int(time.time()) - epoch) // 86400))
-    return None
-
-
 def _format_due_info_short(due_info: Any) -> str:
     if isinstance(due_info, Mapping):
         kind = str(due_info.get("kind") or "")
@@ -110,17 +89,7 @@ def _format_due_info_short(due_info: Any) -> str:
                 return relative_eta(epoch)
             return "learn"
         if kind in ("review_day_index", "learn_day_index"):
-            days = _days_from_today(due_info)
-            if days is not None:
-                if days <= 0:
-                    return "today"
-                if days == 1:
-                    return "tomorrow"
-                return f"{days}d"
-            day_index = due_info.get("day_index")
-            if isinstance(day_index, int):
-                return f"d{day_index}"
-            return "review"
+            return due_day_label(due_info)
         raw = due_info.get("raw")
         return str(raw) if raw is not None else "?"
     if due_info is None:
@@ -570,10 +539,10 @@ class ReviewApp(App[None]):
         if not isinstance(raw, Mapping):
             return {"new": 0, "learn": 0, "review": 0, "total": 0}
 
-        new_count = _safe_int(raw.get("new"), 0)
-        learn_count = _safe_int(raw.get("learn"), 0)
-        review_count = _safe_int(raw.get("review"), 0)
-        total_count = _safe_int(raw.get("total"), new_count + learn_count + review_count)
+        new_count = to_int(raw.get("new"), 0)
+        learn_count = to_int(raw.get("learn"), 0)
+        review_count = to_int(raw.get("review"), 0)
+        total_count = to_int(raw.get("total"), new_count + learn_count + review_count)
 
         return {
             "new": new_count,
@@ -599,7 +568,7 @@ class ReviewApp(App[None]):
         for item in items:
             if not isinstance(item, Mapping):
                 continue
-            ease = _safe_int(item.get("ease"), 0)
+            ease = to_int(item.get("ease"), 0)
             if ease not in hints:
                 continue
             hints[ease] = _format_due_info_short(item.get("due_info"))

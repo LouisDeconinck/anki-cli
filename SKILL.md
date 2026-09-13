@@ -14,6 +14,8 @@ anki status          # check backend and collection health
 anki --format json status  # structured output for parsing
 ```
 
+`status` always exits 0: check `data.ok` / `data.error`, not the exit code.
+
 ### Backend Selection
 
 | Flag | Behavior |
@@ -329,7 +331,7 @@ echo '[{"Front":"Q1","Back":"A1"},{"Front":"Q2","Back":"A2"}]' | anki note:bulk 
 
 ```bash
 anki --format json status
-# verify "ok": true before proceeding
+# verify data.ok == true before proceeding (the command exits 0 either way)
 ```
 
 ## Safety

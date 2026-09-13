@@ -100,6 +100,7 @@ def config_set_cmd(ctx: click.Context, key: str, value: str) -> None:
             "old_value": old_value,
             "new_value": new_value,
         },
+        warnings=loaded.warnings,
     )
 
 

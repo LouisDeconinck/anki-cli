@@ -18,16 +18,30 @@ def _patch_detect_helpers(
     running: bool = False,
     locked: bool = False,
 ) -> dict[str, Any]:
-    """Patch detect internals; returns a dict capturing resolver kwargs."""
+    """Patch detect internals; returns a dict capturing resolver kwargs.
+
+    Discovery is faked to ``[direct_path]`` while the pick/require decisions
+    stay real, so the ``anki_profile`` plumbing is exercised end to end.
+    """
     captured: dict[str, Any] = {}
 
-    def _resolve_spy(col_override, anki_profile=None):
+    def _discover_spy(col_override):
         captured["col_override"] = col_override
-        captured["anki_profile"] = anki_profile
-        return direct_path
+        return [direct_path] if direct_path is not None else []
 
-    monkeypatch.setattr(detect_mod, "_ankiconnect_reachable", lambda url: reachable)
-    monkeypatch.setattr(detect_mod, "_resolve_direct_collection", _resolve_spy)
+    real_pick = detect_mod._pick_collection
+
+    def _pick_spy(candidates, anki_profile=None):
+        captured["anki_profile"] = anki_profile
+        return real_pick(candidates, anki_profile)
+
+    monkeypatch.setattr(
+        detect_mod,
+        "_ankiconnect_reachable",
+        lambda url, allow_non_localhost=False: reachable,
+    )
+    monkeypatch.setattr(detect_mod, "_discover_collections", _discover_spy)
+    monkeypatch.setattr(detect_mod, "_pick_collection", _pick_spy)
     monkeypatch.setattr(detect_mod, "_anki_process_running", lambda: running)
     monkeypatch.setattr(detect_mod, "_sqlite_write_locked", lambda path: locked)
     return captured
@@ -227,18 +241,116 @@ def test_detect_backend_forwards_anki_profile_to_resolver(
     forced: str,
     reachable: bool,
 ) -> None:
-    # Pins every _resolve_direct_collection call site in detect_backend:
+    # Pins every collection-resolution call site in detect_backend:
     # dropping `anki_profile=` anywhere along these paths must fail.
+    # The candidate's parent dir is named "Work" so the real matcher hits.
     captured = _patch_detect_helpers(
         monkeypatch,
         reachable=reachable,
-        direct_path=tmp_path / "collection.anki2",
+        direct_path=tmp_path / "Work" / "collection.anki2",
     )
 
     result = detect_backend(forced_backend=forced, anki_profile="Work")
 
     assert captured["anki_profile"] == "Work"
-    assert "profile 'Work'" in result.reason
+    assert result.collection_path is not None
+    assert result.profile == "Work"
+
+
+def test_forced_ankiconnect_with_unmatched_profile_still_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # The AnkiConnect-branch collection lookup is informational: a profile
+    # miss must not kill a backend that just answered `version`.
+    root = tmp_path / "Anki2"
+    profile_dir = root / "Personal"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "collection.anki2").touch()
+
+    monkeypatch.setattr(detect_mod, "_anki_data_roots", lambda: [root])
+    monkeypatch.setattr(detect_mod, "_ankiconnect_reachable", lambda *a, **k: True)
+
+    result = detect_backend(forced_backend="ankiconnect", anki_profile="Work")
+
+    assert result.backend == "ankiconnect"
+    assert result.collection_path is None
+    assert result.profile is None
+
+
+def test_auto_ankiconnect_reachable_with_unmatched_profile_still_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Anki2"
+    profile_dir = root / "Personal"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "collection.anki2").touch()
+
+    monkeypatch.setattr(detect_mod, "_anki_data_roots", lambda: [root])
+    monkeypatch.setattr(detect_mod, "_ankiconnect_reachable", lambda *a, **k: True)
+
+    result = detect_backend(forced_backend="auto", anki_profile="Work")
+
+    assert result.backend == "ankiconnect"
+    assert result.collection_path is None
+
+
+@pytest.mark.parametrize("forced", ["auto", "direct"])
+def test_missing_col_override_fails_loudly(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    forced: str,
+) -> None:
+    # An explicit --col to a nonexistent file must name the path, not fall
+    # through to a generic "no collection found".
+    monkeypatch.setattr(
+        detect_mod, "_ankiconnect_reachable", lambda *a, **k: False
+    )
+    missing = tmp_path / "missing.anki2"
+
+    with pytest.raises(DetectionError) as exc_info:
+        detect_backend(forced_backend=forced, col_override=missing)
+
+    assert exc_info.value.exit_code == 3
+    assert "Collection override" in str(exc_info.value)
+    assert str(missing.resolve()) in str(exc_info.value)
+
+
+def test_missing_col_override_is_informational_on_ankiconnect(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        detect_mod, "_ankiconnect_reachable", lambda *a, **k: True
+    )
+
+    result = detect_backend(
+        forced_backend="ankiconnect", col_override=tmp_path / "missing.anki2"
+    )
+
+    assert result.backend == "ankiconnect"
+    assert result.collection_path is None
+    assert result.profile is None
+
+
+def test_col_override_result_has_no_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Pins the `col_override is not None` arm: an explicit --col is not a
+    # discovered profile.
+    db = tmp_path / "collection.anki2"
+    db.touch()
+    _patch_detect_helpers(
+        monkeypatch, reachable=False, direct_path=None, running=False, locked=False
+    )
+
+    result = detect_backend(forced_backend="auto", col_override=db)
+
+    assert result.backend == "direct"
+    assert result.collection_path == db.resolve()
+    assert result.profile is None
 
 
 def test_auto_raises_when_nothing_found(
@@ -259,19 +371,23 @@ def test_auto_raises_when_nothing_found(
     assert "No AnkiConnect and no collection found" in str(exc_info.value)
 
 
-def test_resolve_direct_collection_override_exists(tmp_path: Path) -> None:
+def test_require_direct_collection_override_exists(tmp_path: Path) -> None:
     db_path = tmp_path / "collection.anki2"
     db_path.touch()
 
-    resolved = detect_mod._resolve_direct_collection(db_path)
+    resolved = detect_mod._require_direct_collection(db_path, None)
 
     assert resolved == db_path.resolve()
 
 
-def test_resolve_direct_collection_override_missing_returns_none(tmp_path: Path) -> None:
-    resolved = detect_mod._resolve_direct_collection(tmp_path / "missing.anki2")
+def test_require_direct_collection_override_missing_raises(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.anki2"
 
-    assert resolved is None
+    with pytest.raises(DetectionError) as exc_info:
+        detect_mod._require_direct_collection(missing, None)
+
+    assert exc_info.value.exit_code == 3
+    assert "does not exist" in str(exc_info.value)
 
 
 def test_sqlite_write_locked_false_when_db_missing(tmp_path: Path) -> None:

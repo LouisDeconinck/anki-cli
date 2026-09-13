@@ -46,6 +46,14 @@ def create_backend_from_context(obj: dict[str, Any]) -> AnkiBackend:
         except (FileNotFoundError, UnsupportedCollectionError) as exc:
             raise BackendFactoryError(str(exc)) from exc
 
+    if backend_name in {"", "none"}:
+        # Reached when detection failed and the caller degraded to a
+        # backend-less context (e.g. the REPL on a host with no Anki) —
+        # surface the recorded detection failure, not a cryptic name error.
+        reason = str(obj.get("backend_reason") or "").strip().rstrip(".")
+        detail = f": {reason}" if reason and reason != "not required" else ""
+        raise BackendFactoryError(f"No Anki backend available{detail}.")
+
     raise BackendFactoryError(f"Unknown backend '{backend_name}'.")
 
 

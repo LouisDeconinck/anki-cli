@@ -11,7 +11,9 @@ import click
 import pytest
 from click.testing import CliRunner
 
+import anki_cli.backends.factory as factory_mod
 import anki_cli.cli.app as app_mod
+import anki_cli.cli.commands.general as general_mod
 from anki_cli import __version__
 from anki_cli.backends.detect import DetectionError, DetectionResult
 from anki_cli.config_runtime import ConfigError
@@ -32,6 +34,7 @@ def _runtime(
         output_format=output_format,
         no_color=no_color,
         collection_override=collection_override,
+        warnings=[],
     )
 
 
@@ -118,12 +121,86 @@ def _raise_exit3(**kwargs: Any):
     raise DetectionError("no AnkiConnect and no collection found", exit_code=3)
 
 
-@pytest.mark.parametrize("argv", [["version"], ["status"], ["config:path"]])
-def test_backend_free_commands_survive_detection_failure(monkeypatch, argv) -> None:
-    monkeypatch.setattr(app_mod, "detect_backend", _raise_exit3)
-    assert (
-        CliRunner().invoke(app_mod.main, ["--format", "json", *argv]).exit_code == 0
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["version"],
+        ["status"],
+        ["config"],
+        ["config:path"],
+        ["config:set", "--key", "display.color", "--value", "false"],
+    ],
+)
+def test_backend_free_commands_skip_detection(
+    monkeypatch, tmp_path: Path, argv
+) -> None:
+    """The commands a locked-out user needs must not pay for — or die on —
+    backend detection."""
+    runtime = _runtime(
+        backend="auto",
+        output_format="json",
+        collection_override=tmp_path / "override.anki2",
     )
+    runtime.config_path = tmp_path / "config.toml"  # keep config:set off the real disk
+    monkeypatch.setattr(app_mod, "resolve_runtime_config", lambda **kwargs: runtime)
+    monkeypatch.setattr(app_mod, "detect_backend", _raise_exit3)
+    # `status` re-probes via its own module reference; make it fail there too.
+    monkeypatch.setattr(general_mod, "detect_backend", _raise_exit3)
+
+    result = CliRunner().invoke(app_mod.main, ["--format", "json", *argv])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+
+
+def test_status_reports_detection_failure_as_data(monkeypatch) -> None:
+    """`status` turns DetectionError into exit-0 data, not an exit code."""
+    runtime = _runtime(backend="auto", output_format="json")
+    monkeypatch.setattr(app_mod, "resolve_runtime_config", lambda **kwargs: runtime)
+    monkeypatch.setattr(app_mod, "detect_backend", _raise_exit3)
+    monkeypatch.setattr(general_mod, "detect_backend", _raise_exit3)
+
+    result = CliRunner().invoke(app_mod.main, ["--format", "json", "status"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["data"]["ok"] is False
+    assert payload["data"]["backend"] is None
+    assert "no AnkiConnect" in payload["data"]["error"]
+
+
+def test_status_reports_detection_result(monkeypatch, tmp_path: Path) -> None:
+    db = tmp_path / "Work" / "collection.anki2"
+    db.parent.mkdir(parents=True)
+    db.touch()
+    detection = DetectionResult(
+        backend="direct",
+        collection_path=db,
+        reason="forced",
+        profile="Work",
+    )
+    runtime = _runtime(backend="direct", output_format="json")
+    runtime.warnings = ["stale collection.path ignored"]
+    monkeypatch.setattr(app_mod, "resolve_runtime_config", lambda **kwargs: runtime)
+    monkeypatch.setattr(app_mod, "detect_backend", lambda **kwargs: detection)
+    monkeypatch.setattr(general_mod, "detect_backend", lambda **kwargs: detection)
+
+    result = CliRunner().invoke(app_mod.main, ["--format", "json", "status"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["data"] == {
+        "ok": True,
+        "backend": "direct",
+        "collection": str(db),
+        "reason": "forced",
+        "profile": "Work",
+    }
+    # Bootstrap notices reach the consumer inside the envelope, not as a
+    # bare non-JSON line on stderr.
+    assert payload["meta"]["warnings"] == ["stale collection.path ignored"]
 
 
 def test_bootstrap_success_passes_context_to_subcommand(monkeypatch) -> None:
@@ -278,7 +355,7 @@ def test_cli_parameter_sources_not_marked_when_defaults(monkeypatch) -> None:
     assert captured_kwargs["cli_collection_set"] is False
 
 
-def test_no_subcommand_runs_repl_when_available(monkeypatch) -> None:
+def test_no_subcommand_runs_repl_when_available(monkeypatch, tmp_path: Path) -> None:
     calls: dict[str, Any] = {}
 
     module = types.ModuleType("anki_cli.tui.repl")
@@ -299,20 +376,63 @@ def test_no_subcommand_runs_repl_when_available(monkeypatch) -> None:
             collection_override=Path("/tmp/override.db"),
         ),
     )
-    def fail_detect(**kwargs: Any):
-        raise AssertionError("detect_backend must not run for bare 'anki'")
 
-    monkeypatch.setattr(app_mod, "detect_backend", fail_detect)
+    # The REPL runs many backend commands, so detection must happen up front
+    # and the handed-over context must be constructible by the factory.
+    db = tmp_path / "collection.anki2"
+    db.touch()
+    detection = DetectionResult(
+        backend="direct",
+        collection_path=db,
+        reason="forced",
+        profile=None,
+    )
+    monkeypatch.setattr(app_mod, "detect_backend", lambda **kwargs: detection)
 
     runner = CliRunner()
     result = runner.invoke(app_mod.main, [])
 
     assert result.exit_code == 0, result.output
-    # No subcommand is backend-less: the REPL starts with the --col override
-    # (if any) and reports backend "none"; per-command ops resolve lazily.
+    assert calls["obj"]["backend"] == "direct"
+    assert calls["obj"]["collection_path"] == db
+    assert calls["obj"]["backend_reason"] == "forced"
+
+    # Constructibility pin: a "none" backend here left every REPL command dead.
+    backend = factory_mod.create_backend_from_context(calls["obj"])
+    assert backend.collection_path == db.resolve()
+
+
+def test_no_subcommand_detection_failure_opens_repl_with_warning(
+    monkeypatch,
+) -> None:
+    """Bare `anki` on a host with no Anki still opens the REPL; the warning
+    explains why backend commands will fail."""
+    calls: dict[str, Any] = {}
+
+    module = types.ModuleType("anki_cli.tui.repl")
+
+    def fake_run_repl(obj: dict[str, Any]) -> None:
+        calls["obj"] = dict(obj)
+
+    module.run_repl = fake_run_repl  # type: ignore[assignment]
+    monkeypatch.setitem(sys.modules, "anki_cli.tui.repl", module)
+
+    monkeypatch.setattr(
+        app_mod,
+        "resolve_runtime_config",
+        lambda **kwargs: _runtime(backend="auto", output_format="json"),
+    )
+    monkeypatch.setattr(app_mod, "detect_backend", _raise_exit3)
+
+    runner = CliRunner()
+    result = runner.invoke(app_mod.main, [])
+
+    assert result.exit_code == 0, result.output
     assert calls["obj"]["backend"] == "none"
-    assert calls["obj"]["collection_path"] == Path("/tmp/override.db")
-    assert calls["obj"]["backend_reason"] == "not required"
+    assert "no AnkiConnect" in calls["obj"]["backend_reason"]
+    combined = (result.output or "") + (getattr(result, "stderr", "") or "")
+    assert "warning:" in combined
+    assert "backend commands unavailable" in combined
 
 
 def test_no_subcommand_import_error_falls_back_to_help(monkeypatch) -> None:
@@ -326,11 +446,15 @@ def test_no_subcommand_import_error_falls_back_to_help(monkeypatch) -> None:
             collection_override=None,
         ),
     )
-
-    def fail_detect(**kwargs: Any):
-        raise AssertionError("detect_backend must not run for bare 'anki'")
-
-    monkeypatch.setattr(app_mod, "detect_backend", fail_detect)
+    monkeypatch.setattr(
+        app_mod,
+        "detect_backend",
+        lambda **kwargs: DetectionResult(
+            backend="direct",
+            collection_path=Path("/tmp/detected.db"),
+            reason="forced",
+        ),
+    )
 
     monkeypatch.setattr(app_mod, "list_commands", lambda: [])
     monkeypatch.setattr(app_mod, "get_command", lambda name: None)

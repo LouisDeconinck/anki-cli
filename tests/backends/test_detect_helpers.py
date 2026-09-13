@@ -111,7 +111,28 @@ def test_ankiconnect_reachable_false_on_error_payload(monkeypatch: pytest.Monkey
     assert detect_mod._ankiconnect_reachable("http://localhost:8765") is False
 
 
-def test_resolve_direct_collection_scans_roots_and_profiles(
+def test_ankiconnect_reachable_skips_non_localhost_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Without allow_non_localhost the URL is never even POSTed to.
+    client = _FakeClient(
+        response=_FakeResponse(payload={"error": None, "result": 6}),
+    )
+    monkeypatch.setattr(detect_mod.httpx, "Client", lambda timeout: client)
+
+    assert detect_mod._ankiconnect_reachable("http://192.168.1.100:8765") is False
+    assert client.captured_url is None
+
+    assert (
+        detect_mod._ankiconnect_reachable(
+            "http://192.168.1.100:8765", allow_non_localhost=True
+        )
+        is True
+    )
+    assert client.captured_url == "http://192.168.1.100:8765"
+
+
+def test_discover_collections_scans_roots_and_profiles(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -135,17 +156,19 @@ def test_resolve_direct_collection_scans_roots_and_profiles(
 
     monkeypatch.setattr(detect_mod, "_anki_data_roots", lambda: [root_a, root_b])
 
-    assert detect_mod._resolve_direct_collection(None) == db_a
+    assert detect_mod._discover_collections(None) == [db_a, db_b]
+    assert detect_mod._pick_collection([db_a, db_b], None) == db_a
 
 
-def test_resolve_direct_collection_returns_none_when_no_candidates(
+def test_discover_collections_returns_empty_when_no_candidates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     missing_root = tmp_path / "missing"
     monkeypatch.setattr(detect_mod, "_anki_data_roots", lambda: [missing_root])
 
-    assert detect_mod._resolve_direct_collection(None) is None
+    assert detect_mod._discover_collections(None) == []
+    assert detect_mod._pick_collection([], None) is None
 
 
 def _make_anki_root(tmp_path: Path, profiles: list[str]) -> Path:
@@ -157,30 +180,53 @@ def _make_anki_root(tmp_path: Path, profiles: list[str]) -> Path:
     return root
 
 
-def test_resolve_direct_collection_prefers_configured_profile(
+def test_pick_collection_prefers_configured_profile(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = _make_anki_root(tmp_path, ["User 1", "Custom"])
     monkeypatch.setattr(detect_mod, "_anki_data_roots", lambda: [root])
 
-    assert detect_mod._resolve_direct_collection(None) == (
+    candidates = detect_mod._discover_collections(None)
+
+    assert detect_mod._pick_collection(candidates, None) == (
         root / "Custom" / "collection.anki2"
     )
-    assert detect_mod._resolve_direct_collection(None, anki_profile="User 1") == (
+    assert detect_mod._pick_collection(candidates, "User 1") == (
+        root / "User 1" / "collection.anki2"
+    )
+    assert detect_mod._require_direct_collection(None, "User 1") == (
         root / "User 1" / "collection.anki2"
     )
 
 
-def test_resolve_direct_collection_unmatched_profile_raises(
+def test_pick_collection_unmatched_profile_returns_none(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Informational pick never raises — a miss just means nothing to display.
     root = _make_anki_root(tmp_path, ["Personal", "User 1"])
     monkeypatch.setattr(detect_mod, "_anki_data_roots", lambda: [root])
 
+    candidates = detect_mod._discover_collections(None)
+
+    assert detect_mod._pick_collection(candidates, "Work") is None
+
+
+def test_require_direct_collection_unmatched_profile_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Near-miss profile names pin the exact `==` comparison: a mutated
+    # `in`/`.startswith`/`.lower()` match would return a path here instead
+    # of raising.
+    root = _make_anki_root(
+        tmp_path, ["Personal", "User 1", "User", "ser 1", "User 1 (copy)"]
+    )
+    monkeypatch.setattr(detect_mod, "_anki_data_roots", lambda: [root])
+
     with pytest.raises(detect_mod.DetectionError) as exc_info:
-        detect_mod._resolve_direct_collection(None, anki_profile="user 1")
+        detect_mod._require_direct_collection(None, "user 1")
 
     assert exc_info.value.exit_code == 3
     assert "Anki profile 'user 1' not found" in str(exc_info.value)
@@ -188,7 +234,19 @@ def test_resolve_direct_collection_unmatched_profile_raises(
     assert "User 1" in str(exc_info.value)
 
 
-def test_resolve_direct_collection_col_override_wins_over_profile(
+def test_require_direct_collection_profile_strips_whitespace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _make_anki_root(tmp_path, ["Work"])
+    monkeypatch.setattr(detect_mod, "_anki_data_roots", lambda: [root])
+
+    assert detect_mod._require_direct_collection(None, "  Work  ") == (
+        root / "Work" / "collection.anki2"
+    )
+
+
+def test_require_direct_collection_col_override_wins_over_profile(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -199,8 +257,8 @@ def test_resolve_direct_collection_col_override_wins_over_profile(
     override.parent.mkdir()
     override.touch()
 
-    resolved = detect_mod._resolve_direct_collection(
-        override, anki_profile="nonexistent-profile"
+    resolved = detect_mod._require_direct_collection(
+        override, "nonexistent-profile"
     )
 
     assert resolved == override.resolve()
