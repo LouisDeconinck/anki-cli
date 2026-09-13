@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from typing import Final
+
 from pydantic import BaseModel, Field
+
+DEFAULT_ANKICONNECT_URL: Final[str] = "http://localhost:8765"
 
 
 class CollectionConfig(BaseModel):
@@ -10,7 +14,7 @@ class CollectionConfig(BaseModel):
 
 class BackendConfig(BaseModel):
     prefer: str = Field(default="auto")
-    ankiconnect_url: str = "http://localhost:8765"
+    ankiconnect_url: str = DEFAULT_ANKICONNECT_URL
     allow_non_localhost: bool = False
 
 

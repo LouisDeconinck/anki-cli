@@ -8,8 +8,9 @@ from typing import Final, Literal
 
 import httpx
 
+from anki_cli.models.config import DEFAULT_ANKICONNECT_URL
+
 BackendName = Literal["ankiconnect", "direct", "standalone"]
-DEFAULT_ANKICONNECT_URL: Final[str] = "http://localhost:8765"
 DEFAULT_ANKICONNECT_TIMEOUT_S: Final[float] = 0.35
 
 class DetectionError(RuntimeError):

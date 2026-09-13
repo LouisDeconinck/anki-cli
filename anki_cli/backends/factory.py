@@ -9,7 +9,7 @@ from anki_cli.backends.ankiconnect import AnkiConnectBackend, AnkiConnectError
 from anki_cli.backends.direct import DirectBackend
 from anki_cli.backends.protocol import AnkiBackend
 from anki_cli.db.anki_direct import UnsupportedCollectionError
-from anki_cli.models.config import AppConfig
+from anki_cli.models.config import DEFAULT_ANKICONNECT_URL, AppConfig
 
 
 class BackendFactoryError(RuntimeError):
@@ -25,7 +25,7 @@ def create_backend_from_context(obj: dict[str, Any]) -> AnkiBackend:
     collection_path = _coerce_path(obj.get("collection_path"))
     app_config = obj.get("app_config")
 
-    ankiconnect_url = "http://localhost:8765"
+    ankiconnect_url = DEFAULT_ANKICONNECT_URL
     allow_non_localhost = False
     if isinstance(app_config, AppConfig):
         ankiconnect_url = app_config.backend.ankiconnect_url

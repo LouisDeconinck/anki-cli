@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-type JSONPrimitive = str | int | float | bool | None
-type JSONValue = JSONPrimitive | Mapping[str, "JSONValue"] | Sequence["JSONValue"]
+from anki_cli.models.output import JSONValue
 
 
 @runtime_checkable

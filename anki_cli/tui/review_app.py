@@ -20,6 +20,7 @@ from anki_cli import __version__
 from anki_cli.core.scheduler import pick_next_due_card_id
 from anki_cli.core.template import render_template
 from anki_cli.core.undo import UndoItem, UndoStore, now_epoch_ms
+from anki_cli.tui._utils import relative_eta
 from anki_cli.tui.colors import (
     BLUE,
     BORDER,
@@ -85,34 +86,6 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def _queue_name(queue: int) -> str:
-    mapping = {
-        0: "New",
-        1: "Learn",
-        2: "Review",
-        3: "Learn",
-        -1: "Suspended",
-        -2: "Buried",
-        -3: "Buried",
-    }
-    return mapping.get(queue, str(queue))
-
-
-def _relative_eta(epoch_secs: int) -> str:
-    now = int(time.time())
-    delta = max(0, int(epoch_secs) - now)
-    if delta < 60:
-        return "<1m"
-    minutes = delta // 60
-    if minutes < 60:
-        return f"{minutes}m"
-    hours = minutes // 60
-    if hours < 24:
-        return f"{hours}h"
-    days = (hours + 23) // 24
-    return f"{days}d"
-
-
 def _days_from_today(due_info: Mapping[str, Any]) -> int | None:
     """Days until a day-index due. Prefers the backend's relative count; the
     fallback treats epoch_secs as the *start* of the due day, so it rounds up
@@ -134,7 +107,7 @@ def _format_due_info_short(due_info: Any) -> str:
         if kind == "learn_epoch_secs":
             epoch = due_info.get("epoch_secs")
             if isinstance(epoch, int):
-                return _relative_eta(epoch)
+                return relative_eta(epoch)
             return "learn"
         if kind in ("review_day_index", "learn_day_index"):
             days = _days_from_today(due_info)
