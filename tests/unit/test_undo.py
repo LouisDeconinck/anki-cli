@@ -131,3 +131,37 @@ def test_save_failure_keeps_existing_file_and_removes_tmp(monkeypatch, tmp_path)
     assert path.read_text(encoding="utf-8") == original
     # No temp files left behind.
     assert [p.name for p in tmp_path.iterdir()] == ["undo.json"]
+
+
+def test_save_write_failure_removes_tmp_file(monkeypatch, tmp_path) -> None:
+    path = tmp_path / "undo.json"
+    store = UndoStore(path=path)
+    store.push(_item("col-A", 1))
+    original = path.read_text(encoding="utf-8")
+
+    # Stand-in for the temp file NamedTemporaryFile would have created.
+    leaked = tmp_path / ".undo.json.fake.tmp"
+    leaked.write_text("partial", encoding="utf-8")
+
+    class FakeTmp:
+        name = str(leaked)
+
+        def write(self, payload: str) -> None:
+            raise OSError("no space left on device")
+
+        def __enter__(self) -> "FakeTmp":
+            return self
+
+        def __exit__(self, *args: Any) -> bool:
+            return False
+
+    monkeypatch.setattr(
+        undo_mod.tempfile, "NamedTemporaryFile", lambda **kwargs: FakeTmp()
+    )
+
+    with pytest.raises(OSError, match="no space left on device"):
+        store.push(_item("col-A", 2))
+
+    # Existing file intact and the partial temp file removed.
+    assert path.read_text(encoding="utf-8") == original
+    assert not leaked.exists()

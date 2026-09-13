@@ -436,7 +436,12 @@ def test_review_answer_direct_pushes_undo_snapshot(monkeypatch) -> None:
 
         def answer_card(self, *, card_id: int, ease: int) -> dict[str, Any]:
             calls["answer"] = {"card_id": card_id, "ease": ease}
-            return {"card_id": card_id, "ease": ease, "answered": True}
+            return {
+                "card_id": card_id,
+                "ease": ease,
+                "answered": True,
+                "revlog_id": 4242,
+            }
 
     class FakeUndoStore:
         def push(self, item: Any, *, max_items: int = 50) -> None:
@@ -450,7 +455,12 @@ def test_review_answer_direct_pushes_undo_snapshot(monkeypatch) -> None:
     result = runner.invoke(review_answer_cmd, ["--id", "9", "--rating", "easy"], obj=_base_obj())
     payload = _success_payload(result)
 
-    assert payload["data"] == {"card_id": 9, "ease": 4, "answered": True}
+    assert payload["data"] == {
+        "card_id": 9,
+        "ease": 4,
+        "answered": True,
+        "revlog_id": 4242,
+    }
     assert calls["snapshot_card_id"] == 9
     assert calls["answer"] == {"card_id": 9, "ease": 4}
 
@@ -458,8 +468,82 @@ def test_review_answer_direct_pushes_undo_snapshot(monkeypatch) -> None:
     item = pushed[0]
     assert item.collection == "/tmp/col.db"
     assert item.card_id == 9
-    assert item.snapshot == {"id": 9, "queue": 2}
+    # The snapshot carries the revlog id the answer wrote so undo deletes
+    # exactly that row.
+    assert item.snapshot == {"id": 9, "queue": 2, "revlog_id": 4242}
     assert item.created_at_epoch_ms == 123456
+
+
+def test_review_answer_direct_failure_leaves_no_undo_entry(monkeypatch) -> None:
+    pushed: list[Any] = []
+
+    class Store:
+        def snapshot_card_state(self, card_id: int) -> dict[str, Any]:
+            return {"id": card_id, "queue": 2}
+
+    class Backend:
+        name = "direct"
+        collection_path = Path("/tmp/col.db")
+
+        def __init__(self) -> None:
+            self._store = Store()
+
+        def answer_card(self, *, card_id: int, ease: int) -> dict[str, Any]:
+            raise LookupError("missing card")
+
+    class FakeUndoStore:
+        def push(self, item: Any, *, max_items: int = 50) -> None:
+            pushed.append(item)
+
+    _patch_session(monkeypatch, Backend())
+    monkeypatch.setattr(review_cmd_mod, "UndoStore", FakeUndoStore)
+
+    runner = CliRunner()
+    result = runner.invoke(review_answer_cmd, ["--id", "9", "--rating", "hard"], obj=_base_obj())
+    payload = _error_payload(result)
+
+    assert result.exit_code == 1
+    assert payload["error"]["code"] == "BACKEND_OPERATION_FAILED"
+    assert pushed == []
+
+
+def test_review_answer_direct_undo_push_failure_still_succeeds(monkeypatch) -> None:
+    class Store:
+        def snapshot_card_state(self, card_id: int) -> dict[str, Any]:
+            return {"id": card_id, "queue": 2}
+
+    class Backend:
+        name = "direct"
+        collection_path = Path("/tmp/col.db")
+
+        def __init__(self) -> None:
+            self._store = Store()
+
+        def answer_card(self, *, card_id: int, ease: int) -> dict[str, Any]:
+            return {
+                "card_id": card_id,
+                "ease": ease,
+                "answered": True,
+                "revlog_id": 77,
+            }
+
+    class FailingUndoStore:
+        def push(self, item: Any, *, max_items: int = 50) -> None:
+            raise OSError("undo.json: no space left on device")
+
+    _patch_session(monkeypatch, Backend())
+    monkeypatch.setattr(review_cmd_mod, "UndoStore", FailingUndoStore)
+
+    runner = CliRunner()
+    result = runner.invoke(review_answer_cmd, ["--id", "9", "--rating", "good"], obj=_base_obj())
+
+    # The answer committed; a failed undo write warns but cannot fail the
+    # command (a retry would double-apply the review).
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["data"]["answered"] is True
+    assert "undo entry not written" in result.stderr
 
 
 def test_review_answer_operation_error_exit_1(monkeypatch) -> None:

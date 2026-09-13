@@ -1102,7 +1102,6 @@ class AnkiDirectReadStore:
             "left": int(row["left"]),
             "flags": int(row["flags"]),
             "data": str(row["data"] or ""),
-            "created_at_epoch_ms": int(time.time() * 1000),
         }
 
 
@@ -1151,16 +1150,21 @@ class AnkiDirectReadStore:
                 ),
             ).rowcount
 
-            # Match Anki's undo semantics: drop the revlog rows written by the
-            # review being undone (anything logged after the snapshot was taken)
-            # instead of appending a compensating row. Without this, legacy
-            # cards seeded from revlog compute a different stability afterwards.
-            created_at_epoch_ms = snapshot.get("created_at_epoch_ms")
+            # Match Anki's undo semantics: delete the exact revlog row the
+            # undone review wrote (its id is recorded in the snapshot when the
+            # undo entry is pushed) instead of appending a compensating row.
+            # Without this the review's own ease 1..4 row survives and
+            # _seed_fsrs_card_from_revlog keeps picking it up, so legacy cards
+            # seeded from revlog compute a different stability afterwards.
+            # usn = -1 restricts the delete to rows that have not synced yet;
+            # revlog deletions never propagate to AnkiWeb, so removing a
+            # synced row would diverge this collection from the server.
+            revlog_id = snapshot.get("revlog_id")
             revlog_deleted = 0
-            if isinstance(created_at_epoch_ms, int):
+            if isinstance(revlog_id, int) and not isinstance(revlog_id, bool):
                 revlog_deleted = conn.execute(
-                    "DELETE FROM revlog WHERE cid = ? AND id > ?",
-                    (card_id, int(created_at_epoch_ms)),
+                    "DELETE FROM revlog WHERE id = ? AND cid = ? AND usn = -1",
+                    (revlog_id, card_id),
                 ).rowcount
 
         return {
@@ -2418,6 +2422,7 @@ class AnkiDirectReadStore:
             "type": new_type,
             "due": new_due,
             "interval": new_ivl,
+            "revlog_id": revlog_id,
         }
 
     # ---- SQL query helpers ------------------------------------------------

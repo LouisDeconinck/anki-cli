@@ -386,12 +386,13 @@ def test_hint_bar_lists_only_actual_bindings() -> None:
     app._render_hint_bar()
     text = seen["#hintbar"].plain
 
-    for binding in app.BINDINGS:
-        if binding.show:
-            assert binding.description in text
-            assert (binding.key_display or binding.key) in text
-        else:
-            assert binding.description not in text
+    # Exact text so key/label swaps, dropped separators and hidden bindings
+    # leaking in all fail.
+    assert text == (
+        " Space  Show/Hide answer"
+        "    1  Again    2  Hard    3  Good    4  Easy"
+        "    u  Undo    p  Preview    n  Next    :  Command    q  Quit"
+    )
 
     # Phantom keys previously advertised must be gone.
     for phantom in ("edit", "mark", "suspend"):
@@ -428,15 +429,23 @@ def test_action_rate_failed_answer_leaves_no_undo_entry(tmp_path) -> None:
     app._undo = review_mod.UndoStore(path=tmp_path / "undo.json")
     app._set_status = lambda msg: None  # type: ignore[method-assign]
 
+    calls = {"load_next": 0}
+    app._load_next = lambda: calls.__setitem__("load_next", calls["load_next"] + 1)  # type: ignore[method-assign]
+
     app.action_rate(3)
 
     assert app._undo.pop(collection="") is None
+    assert app._answered == 0
+    assert calls["load_next"] == 0
 
 
 def test_action_rate_successful_answer_pushes_undo(tmp_path) -> None:
     class Store:
+        def __init__(self) -> None:
+            self.queue = 2
+
         def snapshot_card_state(self, card_id: int) -> dict[str, Any]:
-            return {"id": card_id, "queue": 2}
+            return {"id": card_id, "queue": self.queue}
 
     class Backend:
         name = "direct"
@@ -444,8 +453,11 @@ def test_action_rate_successful_answer_pushes_undo(tmp_path) -> None:
         def __init__(self) -> None:
             self._store = Store()
 
-        def answer_card(self, *, card_id: int, ease: int) -> None:
-            return None
+        def answer_card(self, *, card_id: int, ease: int) -> dict[str, Any]:
+            # Simulate the reschedule: a snapshot taken after this call would
+            # observe the post-answer queue, not the pre-answer one.
+            self._store.queue = 9
+            return {"card_id": card_id, "ease": ease, "revlog_id": 777}
 
     app = review_mod.ReviewApp(backend=Backend(), deck=None)
     app._card_id = 5
@@ -459,4 +471,44 @@ def test_action_rate_successful_answer_pushes_undo(tmp_path) -> None:
     item = app._undo.pop(collection="")
     assert item is not None
     assert item.card_id == 5
-    assert item.snapshot == {"id": 5, "queue": 2}
+    # Snapshot holds the pre-answer state plus the revlog id the answer wrote.
+    assert item.snapshot == {"id": 5, "queue": 2, "revlog_id": 777}
+    assert app._answered == 1
+
+
+def test_action_rate_undo_push_failure_still_counts_answer(tmp_path) -> None:
+    class Store:
+        def snapshot_card_state(self, card_id: int) -> dict[str, Any]:
+            return {"id": card_id, "queue": 2}
+
+    class Backend:
+        name = "direct"
+
+        def __init__(self) -> None:
+            self._store = Store()
+
+        def answer_card(self, *, card_id: int, ease: int) -> dict[str, Any]:
+            return {"card_id": card_id, "ease": ease, "revlog_id": 777}
+
+    class FailingUndoStore:
+        def push(self, item: Any, *, max_items: int = 50) -> None:
+            raise OSError("undo.json: no space left on device")
+
+    app = review_mod.ReviewApp(backend=Backend(), deck=None)
+    app._card_id = 5
+    app._show_answer = True
+    app._undo = FailingUndoStore()  # type: ignore[assignment]
+
+    statuses: list[str] = []
+    app._set_status = lambda msg: statuses.append(msg)  # type: ignore[method-assign]
+
+    calls = {"load_next": 0}
+    app._load_next = lambda: calls.__setitem__("load_next", calls["load_next"] + 1)  # type: ignore[method-assign]
+
+    app.action_rate(3)
+
+    # The answer committed; a failed undo write warns but cannot fail the
+    # action (a retry would double-apply the review).
+    assert statuses[-1].startswith("answered; undo not saved:")
+    assert app._answered == 1
+    assert calls["load_next"] == 1

@@ -251,10 +251,12 @@ def test_hint_bar_lists_only_actual_bindings() -> None:
     app._render_hint_bar()
     text = captured["#hintbar"].plain
 
-    for binding in app.BINDINGS:
-        if binding.show:
-            assert binding.description in text
-            assert (binding.key_display or binding.key) in text
+    # Exact text so key/label swaps, dropped separators and hidden bindings
+    # leaking in all fail.
+    assert text == (
+        " /  Search    Tab  Cycle filter    Enter  Detail    d  Delete"
+        "    s  Suspend    r  Refresh    q  Quit"
+    )
 
     # Phantom keys previously advertised must be gone.
     for phantom in ("add", "edit"):

@@ -19,6 +19,7 @@ from prompt_toolkit.styles import Style
 from rich import box
 from rich.console import Console, Group
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.panel import Panel
 from rich.progress_bar import ProgressBar
 from rich.table import Table
@@ -458,7 +459,7 @@ def _inline_review(ctx_obj: dict[str, Any], deck: str | None) -> None:
                             console.print(f"  [{DIM}](undone)[/]")
                         except Exception as exc:
                             console.print(
-                                f"  [{RED}]undo failed:[/] {exc}"
+                                f"  [{RED}]undo failed:[/] {escape(str(exc))}"
                             )
                     else:
                         console.print(
@@ -475,35 +476,52 @@ def _inline_review(ctx_obj: dict[str, Any], deck: str | None) -> None:
                     console.print(f"  [{DIM}](1/2/3/4/u/q)[/]")
                     continue
 
-                undo_item: UndoItem | None = None
+                snapshot: dict[str, Any] | None = None
+                collection = ""
                 if (
                     getattr(backend, "name", "") == "direct"
                     and hasattr(backend, "_store")
                 ):
                     col = getattr(backend, "collection_path", None)
                     collection = str(col) if col is not None else ""
-                    snap = cast(
-                        Any, backend._store
-                    ).snapshot_card_state(int(card_id))
-                    undo_item = UndoItem(
-                        collection=collection,
-                        card_id=int(card_id),
-                        snapshot=cast(dict[str, Any], snap),
-                        created_at_epoch_ms=now_epoch_ms(),
+                    snapshot = cast(
+                        dict[str, Any],
+                        cast(Any, backend._store).snapshot_card_state(int(card_id)),
                     )
 
                 try:
-                    backend.answer_card(
+                    result = backend.answer_card(
                         card_id=int(card_id), ease=ease
                     )
                 except Exception as exc:
                     msg = str(exc) or type(exc).__name__
-                    console.print(f"  [{RED}]answer failed:[/] {msg}")
+                    console.print(f"  [{RED}]answer failed:[/] {escape(msg)}")
                 else:
                     # Push only after a successful answer so a failed answer
-                    # cannot leave a stale undo entry.
-                    if undo_item is not None:
-                        undo.push(undo_item)
+                    # cannot leave a stale undo entry. The snapshot carries
+                    # the id of the revlog row this answer wrote so undo can
+                    # delete exactly that row instead of a time window.
+                    if snapshot is not None:
+                        revlog_id = (
+                            result.get("revlog_id")
+                            if isinstance(result, Mapping)
+                            else None
+                        )
+                        undo_item = UndoItem(
+                            collection=collection,
+                            card_id=int(card_id),
+                            snapshot={**snapshot, "revlog_id": revlog_id},
+                            created_at_epoch_ms=now_epoch_ms(),
+                        )
+                        # Best-effort: the answer is already committed, so a
+                        # failed undo write must not escape the loop.
+                        try:
+                            undo.push(undo_item)
+                        except OSError as exc:
+                            console.print(
+                                f"  [{DIM}]answered; undo not saved: "
+                                f"{escape(str(exc))}[/]"
+                            )
                     reviewed += 1
                     console.print(
                         f"  [{DIM}]rated {ease}  (reviewed={reviewed})[/]"

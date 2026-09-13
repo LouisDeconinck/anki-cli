@@ -103,8 +103,8 @@ class UndoStore:
                 suffix=".tmp",
                 delete=False,
             ) as tmp:
-                tmp.write(payload)
                 tmp_name = tmp.name
+                tmp.write(payload)
             os.replace(tmp_name, self._path)
         finally:
             if tmp_name:

@@ -313,4 +313,4 @@ anki --format json status
 - Destructive commands (`note:delete`, `deck:delete`) require `--yes` or will exit with code 2 and `CONFIRMATION_REQUIRED`.
 - Avoid direct-backend writes while Anki Desktop has the collection open.
 - Use `--backend ankiconnect` when Anki Desktop is running.
-- `review:undo` only works with the direct backend and only undoes the last answer.
+- `review:undo` only works with the direct backend and only undoes the last answer. It restores the card's previous state and deletes the revlog row written by the undone answer (matching Anki's own undo); a row that already synced to AnkiWeb is left in place.

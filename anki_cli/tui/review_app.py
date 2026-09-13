@@ -8,6 +8,7 @@ import time
 from collections.abc import Mapping
 from typing import Any, ClassVar, cast
 
+from rich.markup import escape
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -458,27 +459,36 @@ class ReviewApp(App[None]):
         # Save undo snapshot (direct backend only). The snapshot must capture
         # pre-answer state, but it is pushed only after answer_card succeeds so
         # a failed answer cannot leave a stale undo entry.
-        undo_item: UndoItem | None = None
+        snapshot: dict[str, Any] | None = None
+        collection = ""
         if getattr(self._backend, "name", "") == "direct" and hasattr(self._backend, "_store"):
             col = getattr(self._backend, "collection_path", None)
             collection = str(col) if col is not None else ""
             store = cast(Any, self._backend._store)
-            snap = store.snapshot_card_state(int(self._card_id))
+            snapshot = cast(dict[str, Any], store.snapshot_card_state(int(self._card_id)))
+
+        try:
+            result = self._backend.answer_card(card_id=int(self._card_id), ease=int(ease))
+        except Exception as exc:
+            self._set_status(f"answer failed: {escape(str(exc))}")
+            return
+
+        if snapshot is not None:
+            # Carry the id of the revlog row this answer wrote so undo can
+            # delete exactly that row instead of a time window.
+            revlog_id = result.get("revlog_id") if isinstance(result, Mapping) else None
             undo_item = UndoItem(
                 collection=collection,
                 card_id=int(self._card_id),
-                snapshot=cast(dict[str, Any], snap),
+                snapshot={**snapshot, "revlog_id": revlog_id},
                 created_at_epoch_ms=now_epoch_ms(),
             )
-
-        try:
-            self._backend.answer_card(card_id=int(self._card_id), ease=int(ease))
-        except Exception as exc:
-            self._set_status(f"answer failed: {exc}")
-            return
-
-        if undo_item is not None:
-            self._undo.push(undo_item)
+            # Best-effort: the answer is already committed, so a failed undo
+            # write must not escape this action.
+            try:
+                self._undo.push(undo_item)
+            except OSError as exc:
+                self._set_status(f"answered; undo not saved: {escape(str(exc))}")
 
         self._answered += 1
         self._rating_counts[int(ease)] = self._rating_counts.get(int(ease), 0) + 1
@@ -500,7 +510,7 @@ class ReviewApp(App[None]):
         try:
             store.restore_card_state(item.snapshot)
         except Exception as exc:
-            self._set_status(f"undo failed: {exc}")
+            self._set_status(f"undo failed: {escape(str(exc))}")
             return
 
         if self._answered > 0:
@@ -523,7 +533,7 @@ class ReviewApp(App[None]):
         try:
             items = store.preview_ratings(int(self._card_id))
         except Exception as exc:
-            self._set_status(f"preview failed: {exc}")
+            self._set_status(f"preview failed: {escape(str(exc))}")
             return
 
         lines: list[str] = []

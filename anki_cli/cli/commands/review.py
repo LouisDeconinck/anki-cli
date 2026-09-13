@@ -380,23 +380,36 @@ def review_answer_cmd(ctx: click.Context, card_id: int, rating: str) -> None:
             # capture pre-answer state, but it is pushed only after
             # answer_card succeeds so a failed answer cannot leave a stale
             # undo entry.
-            undo_item: UndoItem | None = None
+            snapshot: dict[str, Any] | None = None
+            collection = ""
             if getattr(backend, "name", "") == "direct" and hasattr(backend, "_store"):
                 col = getattr(backend, "collection_path", None)
                 collection = str(col) if col is not None else ""
                 direct_store = cast(Any, backend._store)
-                snap = direct_store.snapshot_card_state(int(card_id))
-                undo_item = UndoItem(
-                    collection=collection,
-                    card_id=int(card_id),
-                    snapshot=cast(dict[str, Any], snap),
-                    created_at_epoch_ms=now_epoch_ms(),
-                )
+                snapshot = cast(dict[str, Any], direct_store.snapshot_card_state(int(card_id)))
 
             result = backend.answer_card(card_id=int(card_id), ease=ease)
 
-            if undo_item is not None:
-                UndoStore().push(undo_item)
+            if snapshot is not None:
+                # Carry the id of the revlog row this answer wrote so undo can
+                # delete exactly that row instead of a time window.
+                revlog_id = result.get("revlog_id") if isinstance(result, Mapping) else None
+                undo_item = UndoItem(
+                    collection=collection,
+                    card_id=int(card_id),
+                    snapshot={**snapshot, "revlog_id": revlog_id},
+                    created_at_epoch_ms=now_epoch_ms(),
+                )
+                # Best-effort: the answer is already committed, so a failed
+                # undo write must not fail the command (a retry would apply a
+                # second review).
+                try:
+                    UndoStore().push(undo_item)
+                except OSError as exc:
+                    click.echo(
+                        f"warning: answer saved but undo entry not written: {exc}",
+                        err=True,
+                    )
     except (BackendNotImplementedError, BackendFactoryError, NotImplementedError) as exc:
         _emit_backend_unavailable(ctx=ctx, command="review:answer", obj=obj, error=exc)
     except (AnkiConnectAPIError, AnkiConnectProtocolError, LookupError) as exc:
