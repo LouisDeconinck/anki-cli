@@ -17,6 +17,7 @@ from anki_cli.backends.protocol import JSONValue
 from anki_cli.cli.dispatcher import register_command
 from anki_cli.cli.formatter import formatter_from_ctx
 from anki_cli.core.search import SearchParseError
+from anki_cli.db.anki_direct import DuplicateNoteError
 
 
 def _emit_backend_unavailable(
@@ -196,12 +197,21 @@ def note_add_cmd(
             )
     except (BackendNotImplementedError, BackendFactoryError, NotImplementedError) as exc:
         _emit_backend_unavailable(ctx=ctx, command="note:add", obj=obj, error=exc)
-    except (AnkiConnectAPIError, LookupError) as exc:
+    except (AnkiConnectAPIError, LookupError, ValueError) as exc:
+        # ValueError covers the direct backend's DuplicateNoteError / EmptyNoteError;
+        # AnkiConnect reports the same conditions as an AnkiConnectAPIError on
+        # `addNote`. The store states the fact; the remedy flag is CLI surface, so
+        # it is appended here.
+        details: dict[str, JSONValue] = {"deck": deck, "notetype": notetype}
+        message = str(exc)
+        if isinstance(exc, DuplicateNoteError):
+            details["duplicate_ids"] = list(exc.duplicate_ids)
+            message = f"{message} Pass --allow-duplicate to add it anyway."
         formatter.emit_error(
             command="note:add",
             code="BACKEND_OPERATION_FAILED",
-            message=str(exc),
-            details={"deck": deck, "notetype": notetype},
+            message=message,
+            details=details,
         )
         raise click.exceptions.Exit(1) from exc
 
@@ -302,12 +312,19 @@ def note_delete_cmd(ctx: click.Context, note_id: int) -> None:
 @click.option("--deck", required=True, help="Deck name")
 @click.option("--notetype", required=True, help="Notetype name")
 @click.option("--file", "file_path", type=click.Path(path_type=Path), default=None)
+@click.option(
+    "--allow-duplicate",
+    is_flag=True,
+    default=False,
+    help="Add notes whose first field already exists in the notetype (otherwise they are null)",
+)
 @click.pass_context
 def note_bulk_cmd(
     ctx: click.Context,
     deck: str,
     notetype: str,
     file_path: Path | None,
+    allow_duplicate: bool,
 ) -> None:
     """Bulk-add notes from a JSON file or stdin."""
     obj: dict[str, Any] = ctx.obj or {}
@@ -363,10 +380,14 @@ def note_bulk_cmd(
 
     try:
         with backend_session_from_context(obj) as backend:
-            results = backend.add_notes(notes_payload)
+            results = backend.add_notes(notes_payload, allow_duplicate=allow_duplicate)
     except (BackendNotImplementedError, BackendFactoryError, NotImplementedError) as exc:
         _emit_backend_unavailable(ctx=ctx, command="note:bulk", obj=obj, error=exc)
-    except AnkiConnectAPIError as exc:
+    except (AnkiConnectAPIError, LookupError, ValueError, RuntimeError) as exc:
+        # Per-item refusals (duplicate/empty/missing deck) come back as null ids;
+        # anything that would fail every item the same way (collection locked,
+        # corrupt notetype config) propagates from add_notes and fails the whole
+        # command rather than reporting N spurious per-item failures.
         formatter.emit_error(
             command="note:bulk",
             code="BACKEND_OPERATION_FAILED",
