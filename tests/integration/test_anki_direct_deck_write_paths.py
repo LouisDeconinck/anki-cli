@@ -178,7 +178,7 @@ def _deck_row(db_path: Path, deck_id: int) -> dict[str, Any]:
     ).fetchone()
     conn.close()
     assert row is not None
-    return {k: row[k] for k in row.keys()}
+    return dict(row)
 
 
 def _deck_names(db_path: Path) -> list[str]:

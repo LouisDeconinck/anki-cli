@@ -247,14 +247,14 @@ def _grouped_help() -> None:
             else group_name.capitalize()
         )
         console.print(f"  [bold {BLUE}]{label}[/]")
-        
+
         table = Table(show_header=False, box=None, padding=(0, 2))
         table.add_column("Command", style=CYAN, width=24)
         table.add_column("Description", style=DIM)
-        
+
         for name, desc in groups[group_name]:
             table.add_row(f"    {name}", desc)
-            
+
         console.print(table)
         console.print()
 
@@ -422,7 +422,7 @@ def _inline_review(ctx_obj: dict[str, Any], deck: str | None) -> None:
                 border_style=GREEN,
                 padding=(1, 2)
             ))
-            
+
             console.print(f"  [{DIM}]1=again  2=hard  3=good  4=easy  u=undo  q=stop[/]")
 
             while True:

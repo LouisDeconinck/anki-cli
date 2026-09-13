@@ -121,9 +121,9 @@ def test_collection_override_from_file_only_when_key_explicit(
         file_data={},
     )
     monkeypatch.setattr(
-        config_runtime, 
-        "load_app_config", 
-        lambda config_path=None: 
+        config_runtime,
+        "load_app_config",
+        lambda config_path=None:
         loaded_without_key
     )
 

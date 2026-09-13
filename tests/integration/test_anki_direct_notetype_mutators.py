@@ -138,7 +138,7 @@ def _notetype_row_by_id(db_path: Path, ntid: int) -> dict[str, Any]:
     ).fetchone()
     conn.close()
     assert row is not None
-    return {k: row[k] for k in row.keys()}
+    return dict(row)
 
 
 def _notetype_row_by_name(db_path: Path, name: str) -> dict[str, Any]:
@@ -150,7 +150,7 @@ def _notetype_row_by_name(db_path: Path, name: str) -> dict[str, Any]:
     ).fetchone()
     conn.close()
     assert row is not None
-    return {k: row[k] for k in row.keys()}
+    return dict(row)
 
 
 def _fields_for_ntid(db_path: Path, ntid: int) -> list[dict[str, Any]]:
@@ -161,7 +161,7 @@ def _fields_for_ntid(db_path: Path, ntid: int) -> list[dict[str, Any]]:
         (ntid,),
     ).fetchall()
     conn.close()
-    return [{k: row[k] for k in row.keys()} for row in rows]
+    return [dict(row) for row in rows]
 
 
 def _templates_for_ntid(db_path: Path, ntid: int) -> list[dict[str, Any]]:
@@ -172,7 +172,7 @@ def _templates_for_ntid(db_path: Path, ntid: int) -> list[dict[str, Any]]:
         (ntid,),
     ).fetchall()
     conn.close()
-    return [{k: row[k] for k in row.keys()} for row in rows]
+    return [dict(row) for row in rows]
 
 
 def _notetype_count(db_path: Path, name: str) -> int:

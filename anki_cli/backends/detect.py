@@ -44,7 +44,7 @@ def detect_backend(
                 exit_code=7
             )
         return DetectionResult(
-            "ankiconnect", 
+            "ankiconnect",
             _resolve_direct_collection(col_override),
             "forced"
         )
