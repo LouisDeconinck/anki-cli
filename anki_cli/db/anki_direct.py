@@ -162,6 +162,14 @@ def _strip_html_preserving_media_filenames(text: str) -> str:
     return stripped
 
 
+class DirectWriteBlockedError(RuntimeError):
+    """Direct write refused: Anki Desktop is running or holds the collection lock.
+
+    Raised by ``_ensure_write_safe`` so callers can catch the refusal by type
+    instead of matching the message text.
+    """
+
+
 class AnkiDirectReadStore:
     """Helpers for Anki's collection(.anki21b/.anki2) schema."""
 
@@ -2656,7 +2664,7 @@ class AnkiDirectReadStore:
         from anki_cli.backends.detect import _anki_process_running, _sqlite_write_locked
 
         if _anki_process_running() or _sqlite_write_locked(self.db_path):
-            raise RuntimeError(
+            raise DirectWriteBlockedError(
                 "Anki Desktop appears to be running while direct write was requested. "
                 "Close Anki Desktop or use --backend ankiconnect."
             )

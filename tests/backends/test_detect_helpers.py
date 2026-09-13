@@ -392,10 +392,11 @@ def test_anki_process_running_linux_skips_current_pid(
     assert detect_mod._anki_process_running_linux() is False
 
 
-def test_sqlite_write_locked_non_lock_operational_error_returns_false(
+def test_sqlite_write_locked_non_lock_operational_error_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A probe that cannot run must not report "not locked" — it re-raises."""
     db_path = tmp_path / "collection.db"
     db_path.touch()
 
@@ -403,5 +404,28 @@ def test_sqlite_write_locked_non_lock_operational_error_returns_false(
         raise sqlite3.OperationalError("permission denied")
 
     monkeypatch.setattr(detect_mod.sqlite3, "connect", fake_connect)
+
+    with pytest.raises(sqlite3.OperationalError, match="permission denied"):
+        detect_mod._sqlite_write_locked(db_path)
+
+
+def test_sqlite_write_locked_probes_path_with_uri_special_chars(
+    tmp_path: Path,
+) -> None:
+    """``?``/``%`` in the filename must be percent-encoded, else the URI probe
+    silently fails open on exactly the collections it exists to protect."""
+    db_path = tmp_path / "col?100%.db"
+    setup = sqlite3.connect(str(db_path))
+    setup.execute("CREATE TABLE t (id INTEGER)")
+    setup.commit()
+    setup.close()
+
+    locker = sqlite3.connect(str(db_path), isolation_level=None, timeout=1.0)
+    locker.execute("BEGIN IMMEDIATE")
+    try:
+        assert detect_mod._sqlite_write_locked(db_path) is True
+    finally:
+        locker.execute("ROLLBACK")
+        locker.close()
 
     assert detect_mod._sqlite_write_locked(db_path) is False

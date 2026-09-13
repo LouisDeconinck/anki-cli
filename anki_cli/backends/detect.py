@@ -277,12 +277,21 @@ def _sqlite_write_locked(db_path: Path) -> bool:
 
     conn: sqlite3.Connection | None = None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=rw", uri=True, timeout=0.05)
+        # ``as_uri`` percent-encodes the path: a raw ``?``/``#``/``%`` in
+        # ``db_path`` would corrupt the URI and make the probe fail with
+        # "unable to open", which must not be read as "not locked".
+        conn = sqlite3.connect(
+            db_path.resolve().as_uri() + "?mode=rw", uri=True, timeout=0.05
+        )
         conn.execute("BEGIN IMMEDIATE")
         conn.execute("ROLLBACK")
         return False
     except sqlite3.OperationalError as exc:
-        return "locked" in str(exc).lower() or "busy" in str(exc).lower()
+        if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+            return True
+        # Fail closed: an unexpected probe error means the lock state is
+        # unknown, not that the collection is safe to write.
+        raise
     finally:
         if conn is not None:
             conn.close()
