@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from hashlib import sha1
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 import betterproto
 from fsrs import Card as FSRSCard
@@ -56,6 +56,18 @@ from anki_cli.proto.anki.notetypes import (
 # (Card::restore_queue_from_type); any epoch after 2001-09-09 exceeds it and
 # no plausible day index ever will.
 LEARN_DUE_EPOCH_THRESHOLD = 1_000_000_000
+
+
+class _SchedulerStepKwargs(TypedDict, total=False):
+    """Optional step overrides for ``fsrs.Scheduler`` (PEP 692 ``**`` kwargs).
+
+    Keeping this a TypedDict lets ``ty`` check each key against the matching
+    ``Scheduler.__init__`` parameter instead of treating the unpacked values as
+    an opaque ``dict[str, list[timedelta]]``.
+    """
+
+    learning_steps: list[timedelta]
+    relearning_steps: list[timedelta]
 
 
 def is_intraday_learn_due(due: int) -> bool:
@@ -3379,7 +3391,7 @@ class AnkiDirectReadStore:
         # always supplies the step lists -- including empty ones, which mean
         # "no (re)learning steps" exactly like blanked steps in Anki. Only when
         # the row itself is missing do py-fsrs's built-in defaults apply.
-        step_kwargs = (
+        step_kwargs: _SchedulerStepKwargs = (
             {
                 "learning_steps": self._to_timedeltas(
                     cfg.learn_steps, assume_minutes=True
