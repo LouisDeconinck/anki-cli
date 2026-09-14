@@ -56,7 +56,7 @@ def detect_backend(
                 "Direct backend forced, but no Anki collection DB was found.",
                 exit_code=3
             )
-        if _anki_process_running() or _sqlite_write_locked(path):
+        if _anki_process_running() or _probe_write_lock(path):
             raise DetectionError(
                 "Anki Desktop appears to be running while AnkiConnect is unavailable. "
                 "Close Anki Desktop or use --backend ankiconnect.",
@@ -80,7 +80,7 @@ def detect_backend(
 
     direct_path = _resolve_direct_collection(col_override)
     if direct_path is not None:
-        if _anki_process_running() or _sqlite_write_locked(direct_path):
+        if _anki_process_running() or _probe_write_lock(direct_path):
             raise DetectionError(
                 "Anki is running but AnkiConnect is unavailable. "
                 "Install AnkiConnect or close Anki Desktop.",
@@ -269,6 +269,23 @@ def _anki_process_running_windows() -> bool:
         return "anki.exe" in output
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
+
+
+def _probe_write_lock(db_path: Path) -> bool:
+    """``_sqlite_write_locked`` for ``detect_backend``, failures translated.
+
+    ``detect_backend`` runs for every subcommand and its only documented
+    failure type is ``DetectionError``; a probe error (unopenable path,
+    non-SQLite file) must surface as BACKEND_UNAVAILABLE, not a raw
+    ``sqlite3`` traceback out of the Click group.
+    """
+    try:
+        return _sqlite_write_locked(db_path)
+    except sqlite3.Error as exc:
+        raise DetectionError(
+            f"Cannot probe the collection lock state at {db_path}: {exc}",
+            exit_code=7,
+        ) from exc
 
 
 def _sqlite_write_locked(db_path: Path) -> bool:

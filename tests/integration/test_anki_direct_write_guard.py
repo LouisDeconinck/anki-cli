@@ -165,6 +165,27 @@ def test_write_refused_while_db_is_write_locked(
     assert_col_untouched(db_path)
 
 
+def test_write_refused_when_lock_probe_is_inconclusive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An unopenable collection must refuse as ``DirectWriteBlockedError``.
+
+    ``_sqlite_write_locked`` re-raises non-lock ``sqlite3.Error`` (fail
+    closed); ``_ensure_write_safe`` translates that into the typed refusal —
+    an inconclusive probe is "blocked", not a raw ``sqlite3`` traceback out
+    of the write path. A directory passes ``exists()`` but
+    ``sqlite3.connect`` cannot open it.
+    """
+    bad = tmp_path / "collection.anki2"
+    bad.mkdir()
+    store = AnkiDirectReadStore(bad)
+    monkeypatch.setattr(detect_mod, "_anki_process_running", lambda: False)
+
+    with pytest.raises(DirectWriteBlockedError, match="Cannot verify the collection lock state"):
+        store.update_note(note_id=1, fields={"Front": "F1"}, tags=None)
+
+
 def test_write_allowed_when_no_anki_process_and_db_unlocked(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

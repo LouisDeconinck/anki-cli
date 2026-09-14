@@ -3087,7 +3087,16 @@ class AnkiDirectReadStore:
     def _ensure_write_safe(self) -> None:
         from anki_cli.backends.detect import _anki_process_running, _sqlite_write_locked
 
-        if _anki_process_running() or _sqlite_write_locked(self.db_path):
+        running = _anki_process_running()
+        try:
+            locked = _sqlite_write_locked(self.db_path)
+        except sqlite3.Error as exc:
+            # Fail closed, but as the typed refusal: an inconclusive probe is
+            # "blocked", not a raw sqlite3 traceback out of the write path.
+            raise DirectWriteBlockedError(
+                f"Cannot verify the collection lock state at {self.db_path}: {exc}"
+            ) from exc
+        if running or locked:
             raise DirectWriteBlockedError(
                 "Anki Desktop appears to be running while direct write was requested. "
                 "Close Anki Desktop or use --backend ankiconnect."
