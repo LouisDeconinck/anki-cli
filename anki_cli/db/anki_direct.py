@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import math
+import random
 import sqlite3
 import time
 from collections.abc import Iterator, Mapping, Sequence
@@ -13,8 +15,19 @@ from typing import TYPE_CHECKING, Any, cast
 import betterproto
 from fsrs import Card as FSRSCard
 from fsrs import Rating, ReviewLog, Scheduler, State
+from fsrs.scheduler import LOWER_BOUNDS_PARAMETERS, UPPER_BOUNDS_PARAMETERS
 
 from anki_cli.core.search import compile_card_query, compile_note_query
+from anki_cli.core.template import (
+    _CLOZE_RE,
+    SPECIAL_FIELDS,
+    TemplateParseError,
+    field_is_empty,
+    parse_template,
+    remove_field_from_template,
+    template_renders_with_fields,
+    template_requirements,
+)
 from anki_cli.db.timing import (
     DEFAULT_ROLLOVER_HOUR,
     SchedTiming,
@@ -82,6 +95,68 @@ def queue_from_type_sql(*, due_expr: str = RESTORED_DUE_SQL) -> str:
                     END"""
 
 
+# py-fsrs 6 wants exactly 21 weights. Anki may still carry FSRS-4.5 (17) or
+# FSRS-5 (19) weights from an older optimizer run; fsrs-rs upgrades those with
+# fixed transforms (model_v6::check_and_fill_parameters_fsrs6), mirrored here.
+FSRS6_PARAM_COUNT = 21
+FSRS5_DEFAULT_DECAY = 0.5
+FSRS6_DEFAULT_PARAMETERS: tuple[float, ...] = (
+    0.212, 1.2931, 2.3065, 8.2956, 6.4133, 0.8334, 3.0194, 0.001, 1.8722, 0.1666, 0.796,
+    1.4835, 0.0614, 0.2629, 1.6483, 0.6014, 1.8729, 0.5425, 0.0912, 0.0658, 0.1542,
+)
+
+# Anki's revlog.type (RevlogReviewKind).
+REVLOG_KIND_LEARNING = 0
+REVLOG_KIND_REVIEW = 1
+REVLOG_KIND_RELEARNING = 2
+REVLOG_KIND_FILTERED = 3  # also used for a review answered before it was due
+
+
+def upgrade_fsrs_parameters(values: list[float]) -> tuple[list[float], str]:
+    """Return 21 FSRS-6 weights plus a label describing where they came from.
+
+    Port of fsrs-rs ``check_and_fill_parameters_fsrs6``: 17 (FSRS-4.5) and 19
+    (FSRS-5) weight sets are transformed the way Anki transforms them before
+    scheduling; anything else falls back to the FSRS-6 defaults.
+    """
+    n = len(values)
+    if n == FSRS6_PARAM_COUNT:
+        return list(values), "fsrs6"
+    if n == 19:
+        return [*values, 0.0, FSRS5_DEFAULT_DECAY], "fsrs5-upgraded"
+    if n == 17:
+        w = list(values)
+        if w[5] * 3.0 + 1.0 <= 0.0:
+            # Corrupt blob; the log below would raise. Anki-optimized w5 >= 0.1.
+            return list(FSRS6_DEFAULT_PARAMETERS), "default"
+        w[4] = w[5] * 2.0 + w[4]
+        w[5] = math.log(w[5] * 3.0 + 1.0) / 3.0
+        w[6] += 0.5
+        return [*w, 0.0, 0.0, 0.0, FSRS5_DEFAULT_DECAY], "fsrs4.5-upgraded"
+    return list(FSRS6_DEFAULT_PARAMETERS), "default"
+
+
+def clamp_fsrs_parameters(values: list[float]) -> tuple[list[float], bool]:
+    """Clamp 21 weights into py-fsrs's accepted range (fsrs-rs ``parameter_clipper``).
+
+    Anki schedules with upgraded legacy weights as-is; py-fsrs refuses anything
+    out of bounds, so clamping keeps the user's optimized weights instead of
+    throwing the whole set away. Returns the clamped list and whether anything
+    changed.
+    """
+    clamped = [
+        min(max(float(w), float(lo)), float(hi))
+        for w, lo, hi in zip(values, LOWER_BOUNDS_PARAMETERS, UPPER_BOUNDS_PARAMETERS, strict=True)
+    ]
+    return clamped, clamped != [float(w) for w in values]
+
+
+def fsrs_fuzz_seed(card_id: int, reps: int) -> int:
+    """rslib ``get_fuzz_seed_for_id_and_reps``: the same card at the same rep
+    count always fuzzes the same way, so a preview matches the later answer."""
+    return (int(card_id) + int(reps)) & 0xFFFFFFFFFFFFFFFF
+
+
 # Lowest collection schema this module understands: separate decks / notetypes /
 # fields / templates / deck_config tables holding protobuf blobs. Anki upgrades a
 # profile to it on first open with 2.1.50+ (2022); older files (schema 11) keep
@@ -91,6 +166,55 @@ MIN_SUPPORTED_SCHEMA_VERSION = 18
 
 class UnsupportedCollectionError(RuntimeError):
     """The collection file is real but its schema is older than we can read or write."""
+
+
+class NoteRejectedError(ValueError):
+    """``add_note`` refused the note before writing anything.
+
+    Base for the per-note refusals that mirror AnkiConnect's ``addNote`` checks
+    (rslib ``note_fields_check``); ``add_notes`` treats these as per-item failures
+    and reports ``None`` for the item, while every other error propagates.
+    """
+
+
+class DuplicateNoteError(NoteRejectedError):
+    """A note of the same notetype already has this first field.
+
+    Mirrors AnkiConnect's "cannot create note because it is a duplicate"; lifted by
+    ``allow_duplicate``. The message states the fact only — the CLI layer appends
+    the ``--allow-duplicate`` remedy, since this module has no CLI surface.
+    """
+
+    # ``duplicate_ids`` always carries the full list; the message stays one readable
+    # line even after a large ``--allow-duplicate`` import.
+    MAX_IDS_IN_MESSAGE = 10
+
+    def __init__(self, *, notetype: str, duplicate_ids: list[int]) -> None:
+        self.notetype = notetype
+        self.duplicate_ids = duplicate_ids
+        shown = duplicate_ids[: self.MAX_IDS_IN_MESSAGE]
+        ids = ", ".join(str(i) for i in shown)
+        if len(duplicate_ids) > len(shown):
+            ids += f" and {len(duplicate_ids) - len(shown)} more"
+        super().__init__(
+            f"Duplicate note: first field matches existing note(s) {ids} "
+            f"in notetype '{notetype}'."
+        )
+
+
+class EmptyNoteError(NoteRejectedError):
+    """The first field is empty once markup is ignored.
+
+    Mirrors AnkiConnect's "cannot create note because it is empty" (rslib
+    ``NoteFieldsState::Empty``). Not lifted by ``allow_duplicate``.
+    """
+
+    def __init__(self, *, notetype: str, field_name: str) -> None:
+        self.notetype = notetype
+        self.field_name = field_name
+        super().__init__(
+            f"Empty note: first field '{field_name}' of notetype '{notetype}' is empty."
+        )
 
 
 class AnkiDirectReadStore:
@@ -429,19 +553,6 @@ class AnkiDirectReadStore:
 
             ntid = self._allocate_row_id(conn, "notetypes")
             now_sec = int(time.time())
-            req_kind = (
-                NotetypeConfigCardRequirementKind.KIND_ALL
-                if normalized_kind == "normal"
-                else NotetypeConfigCardRequirementKind.KIND_NONE
-            )
-            reqs = [
-                NotetypeConfigCardRequirement(
-                    card_ord=ord_,
-                    kind=req_kind,
-                    field_ords=list(range(len(field_names))),
-                )
-                for ord_, _ in enumerate(cleaned_templates)
-            ]
             config = NotetypeConfig(
                 kind=(
                     NotetypeConfigKind.KIND_CLOZE
@@ -450,7 +561,6 @@ class AnkiDirectReadStore:
                 ),
                 sort_field_idx=0,
                 css=css,
-                reqs=reqs,
             )
             conn.execute(
                 """
@@ -488,6 +598,7 @@ class AnkiDirectReadStore:
                         ),
                     ),
                 )
+            self._recompute_reqs(conn, ntid)
 
         return {
             "id": ntid,
@@ -547,6 +658,7 @@ class AnkiDirectReadStore:
                 "UPDATE notetypes SET mtime_secs = ?, usn = -1 WHERE id = ?",
                 (now_sec, ntid),
             )
+            self._recompute_reqs(conn, ntid)
             self._mark_schema_modified(conn)
 
         return {
@@ -614,21 +726,23 @@ class AnkiDirectReadStore:
             sort_idx = max(0, min(sort_idx, new_field_count - 1))
             config.sort_field_idx = sort_idx
 
-            for req in config.reqs:
-                remaining = [
-                    ord_ - 1 if ord_ > removed_ord else ord_
-                    for ord_ in req.field_ords
-                    if ord_ != removed_ord
-                ]
-                if remaining != list(req.field_ords):
-                    req.field_ords = remaining
-                    if not remaining:
-                        req.kind = NotetypeConfigCardRequirementKind.KIND_NONE
-
             conn.execute(
                 "UPDATE notetypes SET mtime_secs = ?, usn = -1, config = ? WHERE id = ?",
                 (now_sec, bytes(config), ntid),
             )
+            # Anki drops references to the removed field from every template
+            # (falling back to the first remaining field if a front would be
+            # left empty), then recomputes the legacy reqs cache from the result.
+            remaining_names = [str(f["name"]) for f in fields if int(f["ord"]) != removed_ord]
+            self._remove_field_from_templates(
+                conn,
+                ntid=ntid,
+                removed_name=stored_field_name,
+                first_remaining_field=remaining_names[0],
+                is_cloze=int(config.kind) == 1,
+                now_sec=now_sec,
+            )
+            self._recompute_reqs(conn, ntid)
             self._mark_schema_modified(conn)
 
             # Field values are stored positionally in notes.flds, so every note of
@@ -789,6 +903,7 @@ class AnkiDirectReadStore:
                 "UPDATE notetypes SET mtime_secs = ?, usn = -1 WHERE id = ?",
                 (now_sec, ntid),
             )
+            self._recompute_reqs(conn, ntid)
             self._mark_schema_modified(conn)
 
         return {
@@ -848,6 +963,8 @@ class AnkiDirectReadStore:
                 "UPDATE notetypes SET mtime_secs = ?, usn = -1 WHERE id = ?",
                 (now_sec, ntid),
             )
+            if front is not None:
+                self._recompute_reqs(conn, ntid)
 
         return {"name": normalized_name, "template": normalized_template, "updated": True}
 
@@ -1272,7 +1389,7 @@ class AnkiDirectReadStore:
                     "answer it in Anki or empty the deck first."
                 )
             # Options come from the home deck when the card is on loan.
-            scheduler, _dr, learn_count, relearn_count = self._build_scheduler(
+            scheduler, _dr, learn_count, relearn_count, params_source = self._build_scheduler_ex(
                 conn, odid if odid != 0 else int(row["did"])
             )
 
@@ -1280,7 +1397,11 @@ class AnkiDirectReadStore:
                 row,
                 timing=timing,
                 now_dt=review_dt,
+                learn_step_count=learn_count,
+                relearn_step_count=relearn_count,
             )
+            if base.last_review is None:
+                base.last_review = self._last_review_time(conn, int(row["id"]))
 
             needs_seed = base.state in (State.Review, State.Relearning) and (
                 base.stability is None or base.difficulty is None or base.last_review is None
@@ -1319,10 +1440,14 @@ class AnkiDirectReadStore:
 
             out: list[dict[str, JSONValue]] = []
             for ease in (1, 2, 3, 4):
-                next_card, _review_log = scheduler.review_card(
+                # Same seed answer_card will use, so the preview matches the write.
+                next_card = self._review_with_fuzz_seed(
+                    scheduler,
                     base,
                     Rating(ease),
                     review_datetime=review_dt,
+                    card_id=int(row["id"]),
+                    reps=int(row["reps"]),
                 )
 
                 (
@@ -1344,6 +1469,7 @@ class AnkiDirectReadStore:
                 out.append(
                     {
                         "ease": ease,
+                        "fsrs_params": params_source,
                         "type": new_type,
                         "queue": new_queue,
                         "due": new_due,
@@ -1975,20 +2101,21 @@ class AnkiDirectReadStore:
                     raise LookupError(f"Missing field '{field_name}' for notetype '{notetype}'.")
                 ordered_values.append(str(fields[field_name]))
 
-            csum = self._field_checksum(ordered_values[0] if ordered_values else "")
-
-            dup_rows = conn.execute(
-                "SELECT id FROM notes WHERE csum = ? ORDER BY id DESC LIMIT 5",
-                (csum,),
-            ).fetchall()
-            dup_ids = [int(r["id"]) for r in dup_rows]
-
-            if dup_ids and not allow_duplicate:
-                import sys
-                sys.stderr.write(
-                    "warning: duplicate note detected (csum match). "
-                    "Pass --allow-duplicate to silence/force.\n"
+            first_field = ordered_values[0] if ordered_values else ""
+            # rslib note_fields_check: Empty is checked before Duplicate and is
+            # not lifted by allow_duplicate. ``field_is_empty`` is the same
+            # predicate card generation uses, so "<br>" and "   " agree.
+            # TODO(#23): run this on the HTML-stripped text once #50 lands.
+            if field_is_empty(first_field):
+                raise EmptyNoteError(
+                    notetype=notetype, field_name=field_names[0] if field_names else ""
                 )
+            csum = self._field_checksum(first_field)
+
+            if not allow_duplicate:
+                dup_ids = self._find_duplicate_note_ids(conn, notetype_id=notetype_id, csum=csum)
+                if dup_ids:
+                    raise DuplicateNoteError(notetype=notetype, duplicate_ids=dup_ids)
 
             note_id = self._allocate_row_id(conn, "notes")
             now_sec = int(time.time())
@@ -2010,7 +2137,7 @@ class AnkiDirectReadStore:
                     tag_text,
                     flds,
                     sfld,
-                    self._field_checksum(ordered_values[0] if ordered_values else ""),
+                    csum,
                 ),
             )
 
@@ -2019,30 +2146,113 @@ class AnkiDirectReadStore:
                 notetype_id,
                 ordered_values,
                 is_cloze,
+                field_names=field_names,
+                has_tags=bool(tag_text.strip()),
+                ensure_not_empty=True,
             )
-            next_due = self._next_new_due(conn)
-            for offset, ord_value in enumerate(template_ords):
-                conn.execute(
-                    """
-                    INSERT INTO cards (
-                        id, nid, did, ord, mod, usn, type, queue, due, ivl, factor, reps,
-                        lapses, left, odue, odid, flags, data
-                    )
-                    VALUES (?, ?, ?, ?, ?, -1, 0, 0, ?, 0, 0, 0, 0, 0, 0, 0, 0, '{}')
-                    """,
-                    (
-                        self._allocate_row_id(conn, "cards"),
-                        note_id,
-                        deck_id,
-                        ord_value,
-                        now_sec,
-                        next_due + offset,
-                    ),
-                )
+            self._insert_new_cards(
+                conn, note_id=note_id, deck_id=deck_id, ords=template_ords, now_sec=now_sec
+            )
 
             return note_id
 
-    def add_notes(self, notes: list[dict[str, JSONValue]]) -> list[int | None]:
+    def _insert_new_cards(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        note_id: int,
+        deck_id: int,
+        ords: list[int],
+        now_sec: int,
+    ) -> None:
+        if not ords:
+            return
+        next_due = self._next_new_due(conn)
+        for offset, ord_value in enumerate(ords):
+            conn.execute(
+                """
+                INSERT INTO cards (
+                    id, nid, did, ord, mod, usn, type, queue, due, ivl, factor, reps,
+                    lapses, left, odue, odid, flags, data
+                )
+                VALUES (?, ?, ?, ?, ?, -1, 0, 0, ?, 0, 0, 0, 0, 0, 0, 0, 0, '{}')
+                """,
+                (
+                    self._allocate_row_id(conn, "cards"),
+                    note_id,
+                    deck_id,
+                    ord_value,
+                    now_sec,
+                    next_due + offset,
+                ),
+            )
+
+    def _generate_missing_cards(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        note_id: int,
+        notetype_id: int,
+        field_values: list[str],
+        field_names: list[str],
+        has_tags: bool,
+        now_sec: int,
+    ) -> list[int]:
+        """Cards a template now renders for but the note lacks (rslib
+        ``generate_cards_for_existing_note``). Existing cards are never removed;
+        Anki leaves that to Empty Cards. New cards go to the deck of the note's
+        existing cards (home deck if one is on loan)."""
+        existing_rows = conn.execute(
+            "SELECT ord, did, odid FROM cards WHERE nid = ? ORDER BY ord", (note_id,)
+        ).fetchall()
+        existing = {int(r["ord"]) for r in existing_rows}
+        nt_row = conn.execute(
+            "SELECT config FROM notetypes WHERE id = ?", (notetype_id,)
+        ).fetchone()
+        is_cloze = False
+        if nt_row is not None:
+            is_cloze = int(
+                self._decode_notetype_config(bytes(nt_row["config"] or b""), ntid=notetype_id).kind
+            ) == 1
+        wanted = self._template_ords_for_note(
+            conn,
+            notetype_id,
+            field_values,
+            is_cloze,
+            field_names=field_names,
+            has_tags=has_tags,
+            ensure_not_empty=False,
+        )
+        missing = sorted(set(wanted) - existing)
+        if not missing:
+            return []
+        if existing_rows:
+            first = existing_rows[0]
+            deck_id = int(first["odid"]) if int(first["odid"]) != 0 else int(first["did"])
+        else:
+            deck_id = 1
+        self._insert_new_cards(
+            conn, note_id=note_id, deck_id=deck_id, ords=missing, now_sec=now_sec
+        )
+        return missing
+
+    def add_notes(
+        self,
+        notes: list[dict[str, JSONValue]],
+        *,
+        allow_duplicate: bool = False,
+    ) -> list[int | None]:
+        """AnkiConnect ``addNotes`` shape: one id per item, ``None`` for a refused one.
+
+        Only *per-item* problems become ``None`` — a duplicate or empty note
+        (``NoteRejectedError``) or a deck/notetype/field that does not exist
+        (``LookupError``). Anything else (collection locked, corrupt notetype
+        config, ...) would fail every item identically, so it propagates and the
+        whole call fails instead of reporting N spurious per-item failures.
+
+        Each item is its own transaction, so without ``allow_duplicate`` the second
+        of two identical items in one batch is refused as a duplicate of the first.
+        """
         output: list[int | None] = []
         for item in notes:
             deck = str(item.get("deck") or item.get("deckName") or "").strip()
@@ -2060,9 +2270,9 @@ class AnkiDirectReadStore:
                     notetype=notetype,
                     fields={str(k): str(v) for k, v in raw_fields.items()},
                     tags=self._coerce_tags(raw_tags),
-                    allow_duplicate=False,
+                    allow_duplicate=allow_duplicate,
                 )
-            except Exception:
+            except (NoteRejectedError, LookupError):
                 output.append(None)
             else:
                 output.append(note_id)
@@ -2119,17 +2329,32 @@ class AnkiDirectReadStore:
                 )
                 updated_fields = True
 
+            tag_text = str(row["tags"] or "")
             if tags is not None:
+                tag_text = self._format_tags(tags)
                 conn.execute(
                     "UPDATE notes SET tags = ?, mod = ?, usn = -1 WHERE id = ?",
-                    (self._format_tags(tags), now_sec, note_id),
+                    (tag_text, now_sec, note_id),
                 )
                 updated_tags = True
+
+            generated_cards: list[int] = []
+            if updated_fields or updated_tags:
+                generated_cards = self._generate_missing_cards(
+                    conn,
+                    note_id=note_id,
+                    notetype_id=notetype_id,
+                    field_values=current_values,
+                    field_names=field_names,
+                    has_tags=bool(tag_text.strip()),
+                    now_sec=now_sec,
+                )
 
         return {
             "note_id": note_id,
             "updated_fields": updated_fields,
             "updated_tags": updated_tags,
+            "generated_cards": generated_cards,
         }
 
     def delete_notes(self, note_ids: list[int]) -> dict[str, JSONValue]:
@@ -2351,11 +2576,23 @@ class AnkiDirectReadStore:
                     "answer it in Anki or empty the deck first."
                 )
 
-            scheduler, desired_retention, learn_count, relearn_count = self._build_scheduler(
-                conn, home_did
-            )
+            (
+                scheduler,
+                desired_retention,
+                learn_count,
+                relearn_count,
+                params_source,
+            ) = self._build_scheduler_ex(conn, home_did)
 
-            fsrs_card = self._card_row_to_fsrs(row, timing=timing, now_dt=review_dt)
+            fsrs_card = self._card_row_to_fsrs(
+                row,
+                timing=timing,
+                now_dt=review_dt,
+                learn_step_count=learn_count,
+                relearn_step_count=relearn_count,
+            )
+            if fsrs_card.last_review is None:
+                fsrs_card.last_review = self._last_review_time(conn, int(row["id"]))
 
             needs_seed = fsrs_card.state in (State.Review, State.Relearning) and (
                 fsrs_card.stability is None
@@ -2399,10 +2636,13 @@ class AnkiDirectReadStore:
             if fsrs_card.state == State.Relearning and fsrs_card.step is None:
                 fsrs_card.step = 0
 
-            next_card, _review_log = scheduler.review_card(
+            next_card = self._review_with_fuzz_seed(
+                scheduler,
                 fsrs_card,
                 Rating(ease),
                 review_datetime=review_dt,
+                card_id=int(row["id"]),
+                reps=int(row["reps"]),
             )
 
             (
@@ -2432,6 +2672,8 @@ class AnkiDirectReadStore:
             data_obj.setdefault(
                 "pos", max(0, self._scheduling_due(row)) if int(row["type"]) == 0 else 0
             )
+            # rslib CardData.last_review_time ("lrt", seconds); Anki prefers it over
+            # the revlog when computing elapsed days.
             data_obj["lrt"] = now_sec
             data_obj["dr"] = round(desired_retention, 2)
             if next_card.stability is not None:
@@ -2500,12 +2742,17 @@ class AnkiDirectReadStore:
             else:
                 logged_factor = max(100, min(1100, round(float(next_card.difficulty) * 100)))
 
-            if old_type == 2 and ease == 1:
-                review_type = 2
+            # rslib RevlogReviewKind comes from the card's state *before* the
+            # answer: new/learning -> Learning, relearning -> Relearning, review ->
+            # Review, or Filtered when a review is answered ahead of its due day.
+            if old_type == 3:
+                review_type = REVLOG_KIND_RELEARNING
             elif old_type == 2:
-                review_type = 1
+                review_type = (
+                    REVLOG_KIND_FILTERED if old_due > today_days else REVLOG_KIND_REVIEW
+                )
             else:
-                review_type = 0
+                review_type = REVLOG_KIND_LEARNING
 
             conn.execute(
                 """
@@ -2528,6 +2775,7 @@ class AnkiDirectReadStore:
             "card_id": card_id,
             "ease": ease,
             "answered": True,
+            "fsrs_params": params_source,
             "queue": new_queue,
             "type": new_type,
             "due": new_due,
@@ -2760,6 +3008,28 @@ class AnkiDirectReadStore:
         digest = sha1(first_field.encode("utf-8")).hexdigest()
         return int(digest[:8], 16)
 
+    def _find_duplicate_note_ids(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        notetype_id: int,
+        csum: int,
+    ) -> list[int]:
+        """Ids of existing notes Anki would flag as duplicates, ascending.
+
+        Follows rslib's ``is_duplicate``: the match is scoped to the notetype
+        (``csum`` alone collides across notetypes that share a front). The caller
+        has already rejected an empty first field. rslib additionally confirms a
+        csum hit by comparing the stripped first-field text; with a 32-bit csum
+        scoped per notetype the collision risk is negligible, so this relies on
+        the csum match (TODO(#23): add the confirm step once #50's stripper lands).
+        """
+        rows = conn.execute(
+            "SELECT id FROM notes WHERE csum = ? AND mid = ? ORDER BY id",
+            (csum, notetype_id),
+        ).fetchall()
+        return [int(r["id"]) for r in rows]
+
     def _coerce_tags(self, value: JSONValue) -> list[str]:
         if isinstance(value, list):
             return [str(item).strip() for item in value if str(item).strip()]
@@ -2840,22 +3110,144 @@ class AnkiDirectReadStore:
         mid: int,
         field_values: list[str],
         is_cloze: bool,
+        *,
+        field_names: list[str] | None = None,
+        has_tags: bool = False,
+        ensure_not_empty: bool = True,
     ) -> list[int]:
-        if is_cloze:
-            import re
+        """Which cards a note should have (rslib ``CardGenContext::new_cards_required``).
 
+        Normal notetypes: a template yields a card only if its front renders
+        non-empty given the note's non-empty fields (plus Anki's special fields).
+        A template that fails to parse never renders, as in Anki. With
+        ``ensure_not_empty`` (new notes) the first template is used when nothing
+        would render. The legacy ``reqs`` cache is not consulted, matching modern
+        Anki.
+        """
+        if is_cloze:
             text = "\n".join(field_values)
-            matches = {int(m.group(1)) for m in re.finditer(r"\{\{c(\d+)::", text)}
+            # rslib parses the cloze number as u16; anything larger is not a cloze.
+            matches = {
+                int(m.group(1)) for m in _CLOZE_RE.finditer(text) if int(m.group(1)) <= 0xFFFF
+            }
             if not matches:
-                return [0]
-            return sorted({max(0, idx - 1) for idx in matches})
+                return [0] if ensure_not_empty else []
+            return sorted({min(499, max(0, idx - 1)) for idx in matches})
 
         rows = conn.execute(
-            "SELECT ord FROM templates WHERE ntid = ? ORDER BY ord",
+            "SELECT ord, config FROM templates WHERE ntid = ? ORDER BY ord",
             (mid,),
         ).fetchall()
-        ords = [int(row["ord"]) for row in rows]
-        return ords if ords else [0]
+        if not rows:
+            return [0] if ensure_not_empty else []
+
+        names = field_names if field_names is not None else self._field_schema_for_mid(conn, mid)[0]
+        nonempty = {
+            name
+            for name, value in zip(names, field_values, strict=False)
+            if not field_is_empty(value)
+        }
+        for special in SPECIAL_FIELDS:
+            if special in names or special == "FrontSide":
+                continue
+            if special == "Tags" and not has_tags:
+                continue
+            nonempty.add(special)
+
+        ords: list[int] = []
+        for row in rows:
+            ord_ = int(row["ord"])
+            cfg = self._decode_template_config(bytes(row["config"] or b""), ntid=mid, ord_=ord_)
+            try:
+                nodes = parse_template(cfg.q_format)
+            except TemplateParseError:
+                continue
+            if template_renders_with_fields(nodes, nonempty):
+                ords.append(ord_)
+        if not ords and ensure_not_empty:
+            return [int(rows[0]["ord"])]
+        return ords
+
+    def _remove_field_from_templates(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        ntid: int,
+        removed_name: str,
+        first_remaining_field: str,
+        is_cloze: bool,
+        now_sec: int,
+    ) -> int:
+        """rslib ``update_templates_for_renamed_and_removed_fields`` (removal case)."""
+        rows = conn.execute(
+            "SELECT ord, config FROM templates WHERE ntid = ? ORDER BY ord", (ntid,)
+        ).fetchall()
+        changed = 0
+        for row in rows:
+            ord_ = int(row["ord"])
+            tcfg = self._decode_template_config(bytes(row["config"] or b""), ntid=ntid, ord_=ord_)
+            before = bytes(tcfg)
+            for attr, question_side in (
+                ("q_format", True),
+                ("a_format", False),
+                ("q_format_browser", True),
+                ("a_format_browser", False),
+            ):
+                text = getattr(tcfg, attr, "") or ""
+                if not text:
+                    continue
+                setattr(
+                    tcfg,
+                    attr,
+                    remove_field_from_template(
+                        text,
+                        {removed_name},
+                        first_remaining_field=first_remaining_field,
+                        is_cloze=is_cloze,
+                        question_side=question_side,
+                    ),
+                )
+            after = bytes(tcfg)
+            if after != before:
+                conn.execute(
+                    "UPDATE templates SET config = ?, mtime_secs = ?, usn = -1 "
+                    "WHERE ntid = ? AND ord = ?",
+                    (after, now_sec, ntid, ord_),
+                )
+                changed += 1
+        return changed
+
+    def _recompute_reqs(self, conn: sqlite3.Connection, ntid: int) -> None:
+        """Rewrite the legacy ``reqs`` cache from the templates (rslib
+        ``Notetype::updated_requirements``). Modern Anki recomputes this on every
+        notetype save; older clients read it to decide which cards to make."""
+        nt_row = conn.execute("SELECT config FROM notetypes WHERE id = ?", (ntid,)).fetchone()
+        if nt_row is None:
+            return
+        config = self._decode_notetype_config(bytes(nt_row["config"] or b""), ntid=ntid)
+        field_names, _ = self._field_schema_for_mid(conn, ntid)
+        rows = conn.execute(
+            "SELECT ord, config FROM templates WHERE ntid = ? ORDER BY ord", (ntid,)
+        ).fetchall()
+
+        kinds = {
+            "any": NotetypeConfigCardRequirementKind.KIND_ANY,
+            "all": NotetypeConfigCardRequirementKind.KIND_ALL,
+            "none": NotetypeConfigCardRequirementKind.KIND_NONE,
+        }
+        reqs: list[NotetypeConfigCardRequirement] = []
+        for row in rows:
+            ord_ = int(row["ord"])
+            tcfg = self._decode_template_config(bytes(row["config"] or b""), ntid=ntid, ord_=ord_)
+            try:
+                kind, ords = template_requirements(parse_template(tcfg.q_format), field_names)
+            except TemplateParseError:
+                kind, ords = "none", []
+            reqs.append(
+                NotetypeConfigCardRequirement(card_ord=ord_, kind=kinds[kind], field_ords=ords)
+            )
+        config.reqs = reqs
+        conn.execute("UPDATE notetypes SET config = ? WHERE id = ?", (bytes(config), ntid))
 
     def _next_new_due(self, conn: sqlite3.Connection) -> int:
         row = conn.execute(
@@ -2916,11 +3308,34 @@ class AnkiDirectReadStore:
                 "card_ids": existing_ids,
             }
 
-    def _build_scheduler(
+    def _build_scheduler_ex(
         self,
         conn: sqlite3.Connection,
         deck_id: int,
-    ) -> tuple[Scheduler, float, int, int]:
+    ) -> tuple[Scheduler, float, int, int, str]:
+        """``_build_scheduler`` plus a label for which FSRS weights were used."""
+        scheduler, retention, learn_n, relearn_n = self._build_scheduler(conn, deck_id)
+        return scheduler, retention, learn_n, relearn_n, self._fsrs_params_source(conn, deck_id)
+
+    def _fsrs_params_source(self, conn: sqlite3.Connection, deck_id: int) -> str:
+        """Informational label for the result payload; never fails a review."""
+        try:
+            cfg, _retention, _has_row = self._deck_config_for_deck(conn, deck_id)
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):
+                return "unknown"
+            raise
+        params, source = self._pick_fsrs_parameters(cfg)
+        try:
+            Scheduler(parameters=params)
+        except ValueError:
+            return "default"
+        return source
+
+    def _deck_config_for_deck(
+        self, conn: sqlite3.Connection, deck_id: int
+    ) -> tuple[DeckConfigConfig, float | None, bool]:
+        """The deck's options preset, its retention override, and whether a config row exists."""
         deck_row = conn.execute("SELECT kind FROM decks WHERE id = ?", (deck_id,)).fetchone()
         config_id = 1
         deck_retention: float | None = None
@@ -2944,8 +3359,15 @@ class AnkiDirectReadStore:
             if cfg_row is not None
             else DeckConfigConfig()
         )
+        return cfg, deck_retention, cfg_row is not None
 
-        params = self._pick_fsrs_parameters(cfg)
+    def _build_scheduler(
+        self,
+        conn: sqlite3.Connection,
+        deck_id: int,
+    ) -> tuple[Scheduler, float, int, int]:
+        cfg, deck_retention, has_config_row = self._deck_config_for_deck(conn, deck_id)
+        params, _params_source = self._pick_fsrs_parameters(cfg)
         desired_retention = (
             deck_retention
             if deck_retention is not None
@@ -2957,21 +3379,32 @@ class AnkiDirectReadStore:
         # always supplies the step lists -- including empty ones, which mean
         # "no (re)learning steps" exactly like blanked steps in Anki. Only when
         # the row itself is missing do py-fsrs's built-in defaults apply.
-        if cfg_row is not None:
-            scheduler = Scheduler(
-                parameters=params,
-                desired_retention=desired_retention,
-                learning_steps=self._to_timedeltas(cfg.learn_steps, assume_minutes=True),
-                relearning_steps=self._to_timedeltas(
+        step_kwargs = (
+            {
+                "learning_steps": self._to_timedeltas(
+                    cfg.learn_steps, assume_minutes=True
+                ),
+                "relearning_steps": self._to_timedeltas(
                     cfg.relearn_steps, assume_minutes=True
                 ),
-                maximum_interval=max_interval,
-            )
-        else:
+            }
+            if has_config_row
+            else {}
+        )
+        try:
             scheduler = Scheduler(
                 parameters=params,
                 desired_retention=desired_retention,
                 maximum_interval=max_interval,
+                **step_kwargs,
+            )
+        except ValueError:
+            # Upgraded legacy weights can land just outside py-fsrs's bounds.
+            scheduler = Scheduler(
+                parameters=list(FSRS6_DEFAULT_PARAMETERS),
+                desired_retention=desired_retention,
+                maximum_interval=max_interval,
+                **step_kwargs,
             )
         return (
             scheduler,
@@ -2980,34 +3413,56 @@ class AnkiDirectReadStore:
             len(scheduler.relearning_steps),
         )
 
-    def _pick_fsrs_parameters(self, cfg: DeckConfigConfig) -> list[float]:
+    def _pick_fsrs_parameters(self, cfg: DeckConfigConfig) -> tuple[list[float], str]:
+        """Newest non-empty weight set on the deck config, upgraded to FSRS-6."""
         for candidate in (cfg.fsrs_params_6, cfg.fsrs_params_5, cfg.fsrs_params_4):
             values = [float(item) for item in candidate]
-            if len(values) >= 19:
-                return values
-        return [
-            0.212,
-            1.2931,
-            2.3065,
-            8.2956,
-            6.4133,
-            0.8334,
-            3.0194,
-            0.001,
-            1.8722,
-            0.1666,
-            0.796,
-            1.4835,
-            0.0614,
-            0.2629,
-            1.6483,
-            0.6014,
-            1.8729,
-            0.5425,
-            0.0912,
-            0.0658,
-            0.1542,
-        ]
+            if values:
+                params, source = upgrade_fsrs_parameters(values)
+                if source == "default":
+                    return params, source
+                params, changed = clamp_fsrs_parameters(params)
+                return params, f"{source}-clamped" if changed else source
+        return list(FSRS6_DEFAULT_PARAMETERS), "default"
+
+    @staticmethod
+    def _review_with_fuzz_seed(
+        scheduler: Scheduler,
+        card: FSRSCard,
+        rating: Rating,
+        *,
+        review_datetime: datetime,
+        card_id: int,
+        reps: int,
+    ) -> FSRSCard:
+        """py-fsrs draws its interval fuzz from the module-level ``random``;
+        seed it per card + rep count like rslib so preview and answer agree."""
+        state = random.getstate()
+        try:
+            random.seed(fsrs_fuzz_seed(card_id, reps))
+            next_card, _log = scheduler.review_card(card, rating, review_datetime=review_datetime)
+        finally:
+            random.setstate(state)
+        return next_card
+
+    @staticmethod
+    def _last_review_time(conn: sqlite3.Connection, card_id: int) -> datetime | None:
+        """Most recent real review of the card, from the revlog (Anki's source of
+        truth); manual reschedules (type 4/5) don't count."""
+        row = conn.execute(
+            """
+            SELECT id FROM revlog
+            WHERE cid = ? AND ease IN (1, 2, 3, 4) AND type IN (0, 1, 2, 3)
+            ORDER BY id DESC LIMIT 1
+            """,
+            (card_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            return datetime.fromtimestamp(int(row["id"]) / 1000.0, tz=UTC)
+        except (OSError, OverflowError, ValueError):
+            return None
 
     def _to_timedeltas(
         self,
@@ -3035,6 +3490,8 @@ class AnkiDirectReadStore:
         *,
         timing: SchedTiming,
         now_dt: datetime,
+        learn_step_count: int = 0,
+        relearn_step_count: int = 0,
     ) -> FSRSCard:
         raw_data = self._parse_card_data(str(row["data"] or ""))
         data: dict[str, JSONValue] = (
@@ -3046,12 +3503,14 @@ class AnkiDirectReadStore:
         stability = self._coerce_float_value(data.get("s"))
         difficulty = self._coerce_float_value(data.get("d"))
 
+        # rslib CardData.last_review_time ("lrt"); callers fall back to the
+        # revlog when it is absent (cards last answered by an older Anki).
         last_review: datetime | None = None
         lrt_value = self._coerce_int_value(data.get("lrt"))
         if lrt_value is not None:
             try:
                 last_review = datetime.fromtimestamp(lrt_value, tz=UTC)
-            except (TypeError, ValueError, OSError):
+            except (TypeError, ValueError, OSError, OverflowError):
                 last_review = None
 
         card_type = int(row["type"])
@@ -3072,8 +3531,16 @@ class AnkiDirectReadStore:
             due_dt = now_dt
             state = State.Learning
 
+        # Anki packs left = today_remaining * 1000 + remaining_steps; the FSRS
+        # step index is how many of the deck's steps are already behind us.
         left_raw = int(row["left"])
-        step = 0 if left_raw > 0 else None
+        step: int | None
+        if left_raw > 0 and state in (State.Learning, State.Relearning):
+            remaining = left_raw % 1000
+            total = relearn_step_count if state == State.Relearning else learn_step_count
+            step = max(0, total - remaining) if total > 0 else 0
+        else:
+            step = None
 
         return FSRSCard(
             card_id=int(row["id"]),
