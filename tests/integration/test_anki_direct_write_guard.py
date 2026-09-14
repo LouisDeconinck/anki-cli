@@ -34,15 +34,24 @@ from tests.integration.conftest import (
 
 
 def _make_store(tmp_path: Path) -> tuple[AnkiDirectReadStore, Path]:
-    """Minimal schema for ``update_note``: col + notes + notetypes + fields."""
+    """Minimal schema for ``update_note``: col + notes + notetypes + fields,
+    plus the tables the card-generation pass touches."""
     # TODO(#37): 17th file-local _make_store — consolidate into conftest.
     # ``notetypes`` is not dead DDL: ``update_note`` → ``_field_schema_for_mid``
-    # selects ``notetypes.config`` for the sort-field index.
+    # selects ``notetypes.config`` for the sort-field index. ``cards`` and
+    # ``templates`` are likewise live: since #59 ``update_note`` runs
+    # ``_generate_missing_cards``, which reads both even when it generates
+    # nothing.
     db_path = tmp_path / "collection.db"
 
     conn = sqlite3.connect(str(db_path))
     conn.executescript(
         """
+        CREATE TABLE decks (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL
+        );
+
         CREATE TABLE notetypes (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL,
@@ -53,6 +62,12 @@ def _make_store(tmp_path: Path) -> tuple[AnkiDirectReadStore, Path]:
             ntid INTEGER NOT NULL,
             ord INTEGER NOT NULL,
             name TEXT NOT NULL
+        );
+
+        CREATE TABLE templates (
+            ntid INTEGER NOT NULL,
+            ord INTEGER NOT NULL,
+            config BLOB NOT NULL DEFAULT X''
         );
 
         CREATE TABLE notes (
@@ -68,10 +83,42 @@ def _make_store(tmp_path: Path) -> tuple[AnkiDirectReadStore, Path]:
             flags INTEGER NOT NULL,
             data TEXT NOT NULL
         );
+
+        CREATE TABLE cards (
+            id INTEGER PRIMARY KEY,
+            nid INTEGER NOT NULL,
+            did INTEGER NOT NULL,
+            ord INTEGER NOT NULL,
+            mod INTEGER NOT NULL,
+            usn INTEGER NOT NULL,
+            type INTEGER NOT NULL,
+            queue INTEGER NOT NULL,
+            due INTEGER NOT NULL,
+            ivl INTEGER NOT NULL,
+            factor INTEGER NOT NULL,
+            reps INTEGER NOT NULL,
+            lapses INTEGER NOT NULL,
+            left INTEGER NOT NULL,
+            odue INTEGER NOT NULL,
+            odid INTEGER NOT NULL,
+            flags INTEGER NOT NULL,
+            data TEXT NOT NULL
+        );
+
+        CREATE TABLE graves (
+            oid INTEGER NOT NULL,
+            type INTEGER NOT NULL,
+            usn INTEGER NOT NULL,
+            PRIMARY KEY (oid, type)
+        );
         """
     )
     conn.executescript(COL_TABLE_SQL)
     insert_col_row(conn, crt=0)
+    conn.execute(
+        "INSERT INTO decks (id, name) VALUES (?, ?)",
+        (1, "Default"),
+    )
     conn.execute(
         "INSERT INTO notetypes (id, name, config) VALUES (?, ?, ?)",
         (10, "Basic", b""),
@@ -220,6 +267,7 @@ def test_write_allowed_when_no_anki_process_and_db_unlocked(
         "note_id": 1001,
         "updated_fields": True,
         "updated_tags": False,
+        "generated_cards": [],
     }
     assert _note_row(db_path, 1001)["sfld"] == "F1"
     assert_col_modified(db_path)

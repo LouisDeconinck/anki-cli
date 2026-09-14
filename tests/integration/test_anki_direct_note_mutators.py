@@ -37,6 +37,7 @@ from tests.integration.conftest import (
     CSUM_R_AMPD_KEPT,
     CSUM_SURROGATE_KEPT,
     CSUM_TEST,
+    CSUM_VIDEO_V_MP4,
     assert_col_untouched,
     insert_col_row,
 )

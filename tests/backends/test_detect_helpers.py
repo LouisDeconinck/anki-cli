@@ -409,12 +409,31 @@ def test_sqlite_write_locked_non_lock_operational_error_fails_closed(
         detect_mod._sqlite_write_locked(db_path)
 
 
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "col%100.db",
+        "col#1.db",
+        "col 100.db",
+        pytest.param(
+            "col?100.db",
+            marks=pytest.mark.skipif(
+                sys.platform == "win32",
+                reason="'?' is reserved in NTFS filenames",
+            ),
+        ),
+    ],
+    ids=["percent", "hash", "space", "question-mark"],
+)
 def test_sqlite_write_locked_probes_path_with_uri_special_chars(
     tmp_path: Path,
+    filename: str,
 ) -> None:
-    """``?``/``%`` in the filename must be percent-encoded, else the URI probe
-    silently fails open on exactly the collections it exists to protect."""
-    db_path = tmp_path / "col?100%.db"
+    """``?``/``#``/``%``/space in the filename must be percent-encoded, else the
+    URI probe silently fails open on exactly the collections it exists to
+    protect. (``#`` truncates the URI at the fragment; ``?`` starts the query —
+    both cut the path before SQLite sees it.)"""
+    db_path = tmp_path / filename
     setup = sqlite3.connect(str(db_path))
     setup.execute("CREATE TABLE t (id INTEGER)")
     setup.commit()
