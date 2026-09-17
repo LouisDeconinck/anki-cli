@@ -14,6 +14,8 @@ anki status          # check backend and collection health
 anki --format json status  # structured output for parsing
 ```
 
+`status` always exits 0: check `data.ok` / `data.error`, not the exit code.
+
 ### Backend Selection
 
 | Flag | Behavior |
@@ -80,6 +82,7 @@ Error:
 | 0 | Success |
 | 1 | Backend operation failed |
 | 2 | Invalid input, confirmation required, or unsupported operation |
+| 3 | No Anki backend found (auto mode could not reach AnkiConnect or find a collection) |
 | 4 | Entity not found |
 | 7 | Backend unavailable |
 
@@ -235,15 +238,25 @@ anki config:set --key "display.default_output" --value "json"
 
 | Filter | Example |
 |--------|---------|
-| Deck | `deck:Japanese`, `deck:Japanese*` (glob) |
-| Notetype | `notetype:Basic` |
-| Tag | `tag:verb`, `tag:lang*` (glob) |
+| Deck | `deck:Japanese` (includes `Japanese::*` subdecks), `deck:Japanese*` (glob), `deck:filtered`, `deck:*` |
+| Notetype | `notetype:Basic` or `note:Basic` |
+| Tag | `tag:verb` (includes `verb::*` children), `tag:lang*` (glob), `tag:none` (untagged), `tag:*` (all) |
 | State | `is:new`, `is:learn`, `is:review`, `is:due`, `is:suspended`, `is:buried` |
+| Added | `added:1` (created since the last rollover), `added:7` |
 | Flag | `flag:1` through `flag:7`, `flag:0` (no flag) |
 | Property | `prop:ivl>30`, `prop:due<5`, `prop:reps>=10`, `prop:lapses=0` |
 | Note ID | `nid:1234567890` |
 | Card ID | `cid:1234567890` |
-| Text | bare words or `"quoted phrase"` |
+| Text | bare words or `"quoted phrase"`; `\:` for a literal colon |
+
+Semantics match Anki: `is:due` never includes new cards (use `is:new`); `is:new`/`is:review` go by
+card type (a suspended new card is still `is:new`); `deck:`/`tag:` are hierarchical and `deck:`
+also finds cards visiting a filtered deck. Any other `prefix:` (`card:`, `rated:`, `mid:`,
+`deck:current`, `front:` field search, ...) is rejected with `INVALID_INPUT` — do not expect it
+to fall back to text search.
+
+`--deck NAME` on `review`, `decks` and `deck` covers the deck **and its subdecks**; a parent row in
+`decks` therefore includes child counts, so do not sum `total_due` across rows.
 
 ### Logical Operators
 
@@ -266,6 +279,13 @@ anki config:set --key "display.default_output" --value "json"
 Location: `~/.config/anki-cli/config.toml`
 
 ```toml
+[collection]
+# anki_profile = "User 1"   # Anki profile directory name; selects
+                            # <Anki2>/<name>/collection.anki2. Unmatched names
+                            # fail with exit 3. --col / ANKI_CLI_COLLECTION /
+                            # collection.path take precedence over it.
+# path = "/abs/collection.anki2"  # explicit collection path override
+
 [backend]
 prefer = "auto"
 ankiconnect_url = "http://localhost:8765"
@@ -274,7 +294,6 @@ allow_non_localhost = false
 [display]
 default_output = "table"
 color = true
-day_boundary_hour = 4
 ```
 
 For remote AnkiConnect (e.g. via Tailscale or LAN):
@@ -322,7 +341,7 @@ echo '[{"Front":"Q1","Back":"A1"},{"Front":"Q2","Back":"A2"}]' | anki note:bulk 
 
 ```bash
 anki --format json status
-# verify "ok": true before proceeding
+# verify data.ok == true before proceeding (the command exits 0 either way)
 ```
 
 ## Safety

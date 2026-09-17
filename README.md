@@ -37,6 +37,9 @@ anki status
 anki version
 ```
 
+`status` always exits 0 — it reports probe results in `data.ok`/`data.error`
+rather than failing, so it works as a health check on hosts with no Anki.
+
 List core entities:
 
 ```bash
@@ -78,11 +81,29 @@ Collection override (direct backend):
 anki --backend direct --col "/path/to/collection.anki2" status
 ```
 
+Anki profile selection (for multi-profile installs):
+
+```toml
+# ~/.config/anki-cli/config.toml
+[collection]
+anki_profile = "Work"
+```
+
+When set, collection discovery picks `<Anki2>/<anki_profile>/collection.anki2`
+instead of the first profile found. A name matching no profile exits with code
+3 and lists the available profiles — but only where a local collection is
+actually required: on the AnkiConnect path the lookup is informational and a
+miss never fails. `--col` takes precedence over it entirely.
+
 Backend behavior:
 
 - `auto`: detects and chooses best available backend
 - `ankiconnect`: forwards search queries to `findCards` and `findNotes`
 - `direct`: compiles queries to SQL and executes directly on the collection DB
+
+The old `standalone` backend was removed: `prefer = "standalone"` in
+`config.toml` and `ANKI_CLI_BACKEND=standalone` warn and run as `auto`;
+`--backend standalone` is rejected at the CLI with a usage error (exit 2).
 
 ### Remote AnkiConnect
 
@@ -98,18 +119,28 @@ allow_non_localhost = true
 
 The remote Anki Desktop must have AnkiConnect configured to accept non-localhost connections. Set `"webBindAddress"` to a specific interface address (e.g. your Tailscale IP) or `"0.0.0.0"` for all interfaces. If binding to all interfaces, consider restricting access with firewall rules.
 
+Without `allow_non_localhost = true` the remote URL is never contacted — the
+detection probe and all data operations refuse non-localhost hosts.
+
 ## Search Query Language
 
-Supported filters:
+Filters follow Anki's own semantics:
 
-- `deck:NAME` (supports `*` glob)
-- `notetype:NAME`
-- `tag:NAME` (supports `*` glob)
-- `is:new`, `is:learn`, `is:review`, `is:due`, `is:suspended`, `is:buried`
+- `deck:NAME` — the deck and its subdecks (`deck:Lang` covers `Lang::Spanish`), including cards visiting a filtered deck; `deck:*` (all), `deck:filtered` (cards in filtered decks); supports `*` glob. Name matching is case-insensitive for ASCII.
+- `notetype:NAME` (or Anki's spelling `note:NAME`)
+- `tag:NAME` — the tag and its children (`tag:verb` covers `verb::irregular`); `tag:none` for untagged notes, `tag:*` for every note; supports `*` glob
+- `is:new` / `is:review` (by card type, so a suspended new card is still `is:new`), `is:learn`, `is:due` (learning/review cards whose due time has passed; never new cards), `is:suspended`, `is:buried`
+- `added:N` — cards created in the last N scheduling days (`added:1` = since the last rollover)
 - `flag:N`
 - `prop:ivl>N`, `prop:due>N`, `prop:reps>N`, `prop:lapses>N` (`<`, `<=`, `=`, `>=`, `>`)
 - `nid:ID`, `cid:ID`
-- bare text and quoted text (`"specific text"`)
+- bare text and quoted text (`"specific text"`); escape a literal colon as `\:`
+
+Any other `prefix:` (for example `card:`, `rated:`, `mid:`, `deck:current`, field searches like
+`front:dog`) is rejected with `INVALID_INPUT` rather than silently searched as text.
+
+The `--deck` option on `review`, `decks` and `deck` follows the same rule: it covers the named deck
+and its subdecks, so a parent row in `decks` includes its children's counts.
 
 Logical syntax:
 
@@ -217,8 +248,12 @@ Exit codes:
 - `0`: success
 - `1`: backend operation failed
 - `2`: invalid input or confirmation required
+- `3`: no Anki backend found (auto mode could not reach AnkiConnect or find a collection)
 - `4`: entity not found
 - `7`: backend unavailable
+
+`status` is the exception: it reports detection failures as
+`{"ok": true, "data": {"ok": false, "error": "..."}}` and still exits 0.
 
 ## AI Agent Integration
 
@@ -257,6 +292,7 @@ For other AI coding agents, point them at `SKILL.md` in the repo root or include
 - In direct mode, avoid write operations while Anki Desktop is open.
 - If Anki Desktop is running, prefer `--backend ankiconnect`.
 - `review:undo` (direct mode only) restores the card's previous state and deletes the revlog row written by the undone answer, matching Anki's own undo.
+- In direct mode, `csum` for notes with HTML in the first field now matches Anki. Rows written by older anki-cli versions keep their old csum until Tools ▸ Check Database recomputes them; duplicate detection may miss them until then.
 
 ## Development
 
