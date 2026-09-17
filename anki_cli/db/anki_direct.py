@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha1
 from html.entities import name2codepoint
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypedDict, cast
+from typing import Any, TypedDict, cast
 
 import betterproto
 from fsrs import Card as FSRSCard
