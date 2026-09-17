@@ -18,10 +18,12 @@ BackendName = Literal["ankiconnect", "direct"]
 DEFAULT_ANKICONNECT_TIMEOUT_S: Final[float] = 0.35
 _LOCAL_HOSTS: Final[set[str]] = {"localhost", "127.0.0.1", "::1"}
 
+
 class DetectionError(RuntimeError):
     def __init__(self, message: str, *, exit_code: int) -> None:
         super().__init__(message)
         self.exit_code = exit_code
+
 
 @dataclass(frozen=True, slots=True)
 class DetectionResult:
@@ -46,7 +48,7 @@ def detect_backend(
     if forced not in get_args(BackendPreference):
         raise DetectionError(
             f"Unsupported backend '{forced_backend}'. Expected auto|ankiconnect|direct.",
-            exit_code=2
+            exit_code=2,
         )
 
     profile = anki_profile.strip() if anki_profile else ""
@@ -55,13 +57,15 @@ def detect_backend(
         if not _ankiconnect_reachable(ankiconnect_url, allow_non_localhost):
             raise DetectionError(
                 f"AnkiConnect backend forced, but it is not reachable at {ankiconnect_url}.",
-                exit_code=7
+                exit_code=7,
             )
         # The collection lookup is informational here — the backend answers
         # without it, so a profile miss or a stale --col must not fail.
         info = _pick_collection(_discover_collections(col_override), profile)
         return DetectionResult(
-            "ankiconnect", info, "forced",
+            "ankiconnect",
+            info,
+            "forced",
             profile=info.parent.name if info is not None and col_override is None else None,
         )
 
@@ -71,21 +75,25 @@ def detect_backend(
             profile,
             empty_message="Direct backend forced, but no Anki collection DB was found.",
         )
-        if _anki_process_running() or _sqlite_write_locked(path):
+        if _anki_process_running() or _probe_write_lock(path):
             raise DetectionError(
                 "Anki Desktop appears to be running while AnkiConnect is unavailable. "
                 "Close Anki Desktop or use --backend ankiconnect.",
                 exit_code=7,
             )
         return DetectionResult(
-            "direct", path, "forced",
+            "direct",
+            path,
+            "forced",
             profile=path.parent.name if col_override is None else None,
         )
 
     if _ankiconnect_reachable(ankiconnect_url, allow_non_localhost):
         info = _pick_collection(_discover_collections(col_override), profile)
         return DetectionResult(
-            "ankiconnect", info, "ankiconnect reachable",
+            "ankiconnect",
+            info,
+            "ankiconnect reachable",
             profile=info.parent.name if info is not None and col_override is None else None,
         )
 
@@ -94,16 +102,19 @@ def detect_backend(
         profile,
         empty_message="No AnkiConnect and no collection found.",
     )
-    if _anki_process_running() or _sqlite_write_locked(direct_path):
+    if _anki_process_running() or _probe_write_lock(direct_path):
         raise DetectionError(
             "Anki is running but AnkiConnect is unavailable. "
             "Install AnkiConnect or close Anki Desktop.",
             exit_code=7,
         )
     return DetectionResult(
-        "direct", direct_path, "ankiconnect unavailable, direct collection found",
+        "direct",
+        direct_path,
+        "ankiconnect unavailable, direct collection found",
         profile=direct_path.parent.name if col_override is None else None,
     )
+
 
 def _ankiconnect_reachable(url: str, allow_non_localhost: bool = False) -> bool:
     host = urlparse(url).hostname or ""
@@ -145,16 +156,12 @@ def _discover_collections(col_override: Path | None) -> list[Path]:
     return candidates
 
 
-def _pick_collection(
-    candidates: list[Path], anki_profile: str | None
-) -> Path | None:
+def _pick_collection(candidates: list[Path], anki_profile: str | None) -> Path | None:
     """Best-effort pick for display only: the configured profile's
     collection, else the first candidate; ``None`` when nothing matches.
     Never raises."""
     if anki_profile:
-        return next(
-            (p for p in candidates if p.parent.name == anki_profile), None
-        )
+        return next((p for p in candidates if p.parent.name == anki_profile), None)
     return candidates[0] if candidates else None
 
 
@@ -215,14 +222,10 @@ def _anki_data_roots() -> list[Path]:
             roots.append(home / ".local" / "share" / "Anki2")
 
         # Linux: Flatpak
-        roots.append(
-            home / ".var" / "app" / "net.ankiweb.Anki" / "data" / "Anki2"
-        )
+        roots.append(home / ".var" / "app" / "net.ankiweb.Anki" / "data" / "Anki2")
 
         # Linux: Snap
-        roots.append(
-            home / "snap" / "anki" / "current" / ".local" / "share" / "Anki2"
-        )
+        roots.append(home / "snap" / "anki" / "current" / ".local" / "share" / "Anki2")
 
     return roots
 
@@ -255,18 +258,14 @@ def _anki_process_running_linux() -> bool:
 
         try:
             if comm.exists():
-                name = comm.read_text(
-                    encoding="utf-8", errors="ignore"
-                ).strip().lower()
+                name = comm.read_text(encoding="utf-8", errors="ignore").strip().lower()
                 if name in desktop_names:
                     return True
 
             if cmdline.exists():
                 raw = cmdline.read_bytes().split(b"\x00")
                 argv = [
-                    part.decode("utf-8", errors="ignore").strip().lower()
-                    for part in raw
-                    if part
+                    part.decode("utf-8", errors="ignore").strip().lower() for part in raw if part
                 ]
                 if not argv:
                     continue
@@ -275,9 +274,7 @@ def _anki_process_running_linux() -> bool:
                 if argv0_name in desktop_names:
                     return True
 
-                if argv0_name == "flatpak" and any(
-                    tok == flatpak_app_id for tok in argv[1:]
-                ):
+                if argv0_name == "flatpak" and any(tok == flatpak_app_id for tok in argv[1:]):
                     return True
 
         except OSError:
@@ -316,18 +313,42 @@ def _anki_process_running_windows() -> bool:
         return False
 
 
+def _probe_write_lock(db_path: Path) -> bool:
+    """``_sqlite_write_locked`` for ``detect_backend``, failures translated.
+
+    ``detect_backend`` runs for every subcommand and its only documented
+    failure type is ``DetectionError``; a probe error (unopenable path,
+    non-SQLite file) must surface as BACKEND_UNAVAILABLE, not a raw
+    ``sqlite3`` traceback out of the Click group.
+    """
+    try:
+        return _sqlite_write_locked(db_path)
+    except sqlite3.Error as exc:
+        raise DetectionError(
+            f"Cannot probe the collection lock state at {db_path}: {exc}",
+            exit_code=7,
+        ) from exc
+
+
 def _sqlite_write_locked(db_path: Path) -> bool:
     if not db_path.exists():
         return False
 
     conn: sqlite3.Connection | None = None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=rw", uri=True, timeout=0.05)
+        # ``as_uri`` percent-encodes the path: a raw ``?``/``#``/``%`` in
+        # ``db_path`` would corrupt the URI and make the probe fail with
+        # "unable to open", which must not be read as "not locked".
+        conn = sqlite3.connect(db_path.resolve().as_uri() + "?mode=rw", uri=True, timeout=0.05)
         conn.execute("BEGIN IMMEDIATE")
         conn.execute("ROLLBACK")
         return False
     except sqlite3.OperationalError as exc:
-        return "locked" in str(exc).lower() or "busy" in str(exc).lower()
+        if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+            return True
+        # Fail closed: an unexpected probe error means the lock state is
+        # unknown, not that the collection is safe to write.
+        raise
     finally:
         if conn is not None:
             conn.close()

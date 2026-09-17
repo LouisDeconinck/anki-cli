@@ -117,6 +117,32 @@ def test_detection_error_emits_backend_unavailable_with_exit_code(monkeypatch) -
     assert payload["meta"]["command"] == "bootstrap"
 
 
+def test_cli_unopenable_collection_emits_backend_unavailable(tmp_path: Path) -> None:
+    """End-to-end: an unopenable ``--col`` emits the envelope, no traceback.
+
+    ``resolve_runtime_config``/``detect_backend`` run unstubbed: the regression
+    was the fail-closed lock probe's ``sqlite3.OperationalError`` escaping
+    ``detect_backend`` — ``app.py`` catches only ``DetectionError`` — so
+    ``anki --backend direct --col <dir> decks`` crashed instead of emitting
+    BACKEND_UNAVAILABLE. A directory passes ``exists()`` but
+    ``sqlite3.connect`` cannot open it. ``decks`` is used because ``version``
+    is backendless and skips detection entirely.
+    """
+    bad = tmp_path / "collection.anki2"
+    bad.mkdir()
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app_mod.main,
+        ["--backend", "direct", "--format", "json", "--col", str(bad), "decks"],
+    )
+
+    payload = _error_payload(result)
+    assert result.exit_code == 7
+    assert payload["error"]["code"] == "BACKEND_UNAVAILABLE"
+    assert "Traceback" not in result.output
+
+
 def _raise_exit3(**kwargs: Any):
     raise DetectionError("no AnkiConnect and no collection found", exit_code=3)
 
@@ -131,9 +157,7 @@ def _raise_exit3(**kwargs: Any):
         ["config:set", "--key", "display.color", "--value", "false"],
     ],
 )
-def test_backend_free_commands_skip_detection(
-    monkeypatch, tmp_path: Path, argv
-) -> None:
+def test_backend_free_commands_skip_detection(monkeypatch, tmp_path: Path, argv) -> None:
     """The commands a locked-out user needs must not pay for — or die on —
     backend detection."""
     runtime = _runtime(
